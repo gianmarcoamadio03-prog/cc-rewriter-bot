@@ -277,4 +277,191 @@ async def finalize_media_group(context: ContextTypes.DEFAULT_TYPE, key: str):
         caption_html, _ = rewrite_html_message_safe(buf.caption_html)
         caption_plain = html_to_plain_with_links(caption_html)
 
-    photos = list(
+    photos = list(dict.fromkeys(buf.photo_file_ids))
+    if len(photos) > MAX_PHOTOS:
+        photos = random.sample(photos, k=MAX_PHOTOS)
+
+    if not photos:
+        # niente foto: non pubblichiamo nulla (clean)
+        return
+
+    # 1) prova con caption HTML (se c'è)
+    try:
+        media = []
+        for i, fid in enumerate(photos):
+            if i == 0 and caption_html:
+                media.append(InputMediaPhoto(media=fid, caption=caption_html, parse_mode=ParseMode.HTML))
+            else:
+                media.append(InputMediaPhoto(media=fid))
+        await context.bot.send_media_group(chat_id=OUTPUT_CHAT_ID_INT, media=media)
+        return
+    except BadRequest as e:
+        msg = str(e).lower()
+        # se HTML non valido -> fallback testo plain (sempre clean)
+        if "can't parse entities" not in msg and "can't parse inputmedia" not in msg:
+            log.warning("send_media_group failed (non-entity): %s", e)
+
+    # 2) fallback: caption PLAIN (senza parse_mode)
+    try:
+        media2 = []
+        for i, fid in enumerate(photos):
+            if i == 0 and caption_plain:
+                media2.append(InputMediaPhoto(media=fid, caption=caption_plain))
+            else:
+                media2.append(InputMediaPhoto(media=fid))
+        await context.bot.send_media_group(chat_id=OUTPUT_CHAT_ID_INT, media=media2)
+        return
+    except Exception as e:
+        log.warning("send_media_group fallback plain failed: %s", e)
+
+    # 3) ultimo fallback: album senza caption (pur di non sporcare)
+    try:
+        media3 = [InputMediaPhoto(media=fid) for fid in photos]
+        await context.bot.send_media_group(chat_id=OUTPUT_CHAT_ID_INT, media=media3)
+    except Exception as e:
+        log.exception("Failed to send album: %s", e)
+
+# =====================================
+# COMMANDS
+# =====================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ Bot pronto (modalità CLEAN).\n"
+        "Inoltra i post in privato: io pubblico nel gruppo solo data + post convertito.",
+        disable_web_page_preview=True,
+    )
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🆔 Chat ID: <code>{update.effective_chat.id}</code>\n"
+        f"🆔 Your User ID: <code>{update.effective_user.id}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+# =====================================
+# MAIN HANDLER (DM only + owner only)
+# =====================================
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    # solo chat privata
+    if update.effective_chat.type != "private":
+        return
+
+    # se OWNER_USER_ID è settato, accetta solo te
+    if OWNER_USER_ID_INT and update.effective_user.id != OWNER_USER_ID_INT:
+        return
+
+    if not OUTPUT_CHAT_ID_INT:
+        await msg.reply_text("⚠️ OUTPUT_CHAT_ID non impostato (Railway Variables).")
+        return
+
+    # ALBUM: raccogli solo foto (video ignorati)
+    if msg.media_group_id:
+        key = str(msg.media_group_id)
+        async with LOCK:
+            buf = BUFFERS.get(key)
+            if not buf:
+                buf = MediaGroupBuffer(media_group_id=key)
+                BUFFERS[key] = buf
+
+            if msg.photo:
+                buf.photo_file_ids.append(msg.photo[-1].file_id)
+
+            if not buf.caption_html and msg.caption_html:
+                buf.caption_html = msg.caption_html
+
+            if buf.task and not buf.task.done():
+                buf.task.cancel()
+            buf.task = asyncio.create_task(finalize_media_group(context, key))
+        return
+
+    # VIDEO singolo: IGNORA (clean)
+    if msg.video:
+        return
+
+    # FOTO singola
+    if msg.photo:
+        await send_daily_header_if_needed(context)
+
+        caption_html = None
+        caption_plain = None
+        if msg.caption_html:
+            caption_html, _ = rewrite_html_message_safe(msg.caption_html)
+            caption_plain = html_to_plain_with_links(caption_html)
+
+        # prova HTML
+        try:
+            await context.bot.send_photo(
+                chat_id=OUTPUT_CHAT_ID_INT,
+                photo=msg.photo[-1].file_id,
+                caption=(caption_html if caption_html else None),
+                parse_mode=(ParseMode.HTML if caption_html else None),
+            )
+            return
+        except BadRequest:
+            pass
+
+        # fallback plain
+        try:
+            await context.bot.send_photo(
+                chat_id=OUTPUT_CHAT_ID_INT,
+                photo=msg.photo[-1].file_id,
+                caption=(caption_plain if caption_plain else None),
+            )
+            return
+        except Exception:
+            pass
+
+        # ultimo fallback: senza caption
+        await context.bot.send_photo(
+            chat_id=OUTPUT_CHAT_ID_INT,
+            photo=msg.photo[-1].file_id,
+        )
+        return
+
+    # TESTO
+    if msg.text_html:
+        # riscrivi e invia SOLO se c'è una conversione (clean)
+        rewritten_html, changed = rewrite_html_message_safe(msg.text_html)
+        if not changed:
+            return
+
+        await send_daily_header_if_needed(context)
+
+        # prova HTML
+        try:
+            await context.bot.send_message(
+                chat_id=OUTPUT_CHAT_ID_INT,
+                text=rewritten_html,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+        except BadRequest:
+            pass
+
+        # fallback plain
+        plain = html_to_plain_with_links(rewritten_html, max_len=4096)
+        await context.bot.send_message(
+            chat_id=OUTPUT_CHAT_ID_INT,
+            text=plain,
+            disable_web_page_preview=True,
+        )
+
+def main():
+    # Hardening timeout rete (evita timeout random)
+    request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
+
+    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle))
+
+    log.info("Bot running (CLEAN)...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
