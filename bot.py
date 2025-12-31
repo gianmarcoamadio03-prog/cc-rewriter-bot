@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 from telegram import Update, InputMediaPhoto
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -32,8 +34,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("cc-rewriter-dm")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_USER_ID = os.getenv("OWNER_USER_ID")          # tuo user id telegram
-OUTPUT_CHAT_ID = os.getenv("OUTPUT_CHAT_ID")        # chat id gruppo "POST PRONTI" (supergroup -100...)
+OWNER_USER_ID = os.getenv("OWNER_USER_ID")
+OUTPUT_CHAT_ID = os.getenv("OUTPUT_CHAT_ID")
 
 MULEBUY_REF = os.getenv("MULEBUY_REF", "200836051")
 CNFANS_REF = os.getenv("CNFANS_REF", "222394")
@@ -42,7 +44,7 @@ TZ = os.getenv("TZ", "Europe/Rome")
 MAX_PHOTOS = int(os.getenv("MAX_PHOTOS", "4"))
 MEDIA_GROUP_WAIT = float(os.getenv("MEDIA_GROUP_WAIT", "1.2"))
 
-STATE_FILE = os.getenv("STATE_FILE", "state.json")  # su Railway può resettarsi dopo deploy (ok)
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -67,7 +69,7 @@ def save_state(state: dict) -> None:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception:
-        # su alcuni host filesystem può essere read-only o volatile; non è bloccante
+        # filesystem su host può essere volatile -> non bloccare
         pass
 
 STATE = load_state()
@@ -108,7 +110,6 @@ def normalize_netloc(netloc: str) -> str:
     return netloc.lower().lstrip("www.")
 
 def rebuild_url(p, new_query: str) -> str:
-    # NON cambia schema (http/https) né host/path ecc.
     return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
 
 def transform_mulebuy(url: str) -> str:
@@ -117,9 +118,7 @@ def transform_mulebuy(url: str) -> str:
         return url
     if not p.path.startswith("/product"):
         return url
-
     q = list(parse_qsl(p.query, keep_blank_values=True))
-    # rimuovi qualsiasi ref esistente (anche multipli) e metti SOLO il tuo
     q = [(k, v) for (k, v) in q if k.lower() != "ref"]
     q.append(("ref", MULEBUY_REF))
     return rebuild_url(p, urlencode(q, doseq=True))
@@ -147,7 +146,6 @@ def transform_cnfans(url: str) -> str:
         else:
             others.append((k, v))
 
-    # formato voluto: platform, id, ref, poi eventuali altri parametri
     ordered = []
     if platform is not None:
         ordered.append(("platform", platform))
@@ -165,7 +163,6 @@ def transform_url(url: str) -> str:
 
 def rewrite_plain_text(text: str) -> tuple[str, bool]:
     changed = False
-
     def repl(m):
         nonlocal changed
         raw = m.group(1)
@@ -174,26 +171,44 @@ def rewrite_plain_text(text: str) -> tuple[str, bool]:
         if new != base:
             changed = True
         return new + trail
-
     return URL_RE.sub(repl, text), changed
 
-def rewrite_html_message(html_text: str) -> tuple[str, bool]:
+def rewrite_html_message_safe(html_text: str) -> tuple[str, bool]:
     """
-    Riscrive anche i link cliccabili (href="...") mantenendo il formato HTML.
+    Riscrive in modo sicuro:
+    - href="..." nei tag <a>
+    - eventuali URL in testo (solo fuori dai tag), evitando di rompere HTML
     """
     changed = False
 
+    # 1) riscrivi href="..."
     def href_repl(m):
         nonlocal changed
         old = html.unescape(m.group(1))
         new = transform_url(old)
         if new != old:
             changed = True
+        # IMPORTANT: escape per HTML (così & diventa &amp; e non rompe)
         return f'href="{html.escape(new, quote=True)}"'
 
     out = HREF_RE.sub(href_repl, html_text)
-    out2, changed2 = rewrite_plain_text(out)
-    return out2, (changed or changed2)
+
+    # 2) riscrivi URL “visibili” SOLO fuori dai tag (<...>)
+    parts = re.split(r"(<[^>]+>)", out)  # tag = indici dispari
+    def repl_visible(m):
+        nonlocal changed
+        raw = m.group(1)
+        base, trail = strip_trailing_punct(raw)
+        new = transform_url(base)
+        if new != base:
+            changed = True
+        # escape per evitare errori di entity parsing
+        return html.escape(new, quote=False) + trail
+
+    for i in range(0, len(parts), 2):  # solo testo
+        parts[i] = URL_RE.sub(repl_visible, parts[i])
+
+    return "".join(parts), changed
 
 # =====================================
 # MEDIA GROUP BUFFER (albums)
@@ -221,9 +236,8 @@ async def finalize_media_group(context: ContextTypes.DEFAULT_TYPE, key: str):
 
     rewritten_caption = None
     if buf.caption_html:
-        rewritten_caption, _ = rewrite_html_message(buf.caption_html)
+        rewritten_caption, _ = rewrite_html_message_safe(buf.caption_html)
 
-    # max 4 foto casuali, video ignorati (non raccolti)
     photos = list(dict.fromkeys(buf.photo_file_ids))
     if len(photos) > MAX_PHOTOS:
         photos = random.sample(photos, k=MAX_PHOTOS)
@@ -239,8 +253,27 @@ async def finalize_media_group(context: ContextTypes.DEFAULT_TYPE, key: str):
                     media.append(InputMediaPhoto(media=fid, caption=rewritten_caption, parse_mode=ParseMode.HTML))
                 else:
                     media.append(InputMediaPhoto(media=fid))
-            sent_msgs = await context.bot.send_media_group(chat_id=OUTPUT_CHAT_ID_INT, media=media)
-            first_id = sent_msgs[0].message_id if sent_msgs else None
+
+            try:
+                sent_msgs = await context.bot.send_media_group(chat_id=OUTPUT_CHAT_ID_INT, media=media)
+                first_id = sent_msgs[0].message_id if sent_msgs else None
+            except BadRequest as e:
+                # Fallback: manda album SENZA caption e poi caption come messaggio separato
+                if "can't parse entities" in str(e).lower() or "can't parse inputmedia" in str(e).lower():
+                    media2 = [InputMediaPhoto(media=fid) for fid in photos]
+                    sent_msgs = await context.bot.send_media_group(chat_id=OUTPUT_CHAT_ID_INT, media=media2)
+                    first_id = sent_msgs[0].message_id if sent_msgs else None
+                    if rewritten_caption:
+                        await context.bot.send_message(
+                            chat_id=OUTPUT_CHAT_ID_INT,
+                            text=rewritten_caption,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                            reply_to_message_id=first_id if first_id else None,
+                        )
+                else:
+                    raise
+
         else:
             sent = await context.bot.send_message(
                 chat_id=OUTPUT_CHAT_ID_INT,
@@ -250,7 +283,6 @@ async def finalize_media_group(context: ContextTypes.DEFAULT_TYPE, key: str):
             )
             first_id = sent.message_id
 
-        # bollino SOLO per te (reply separata: non inoltrarla)
         if first_id:
             await context.bot.send_message(
                 chat_id=OUTPUT_CHAT_ID_INT,
@@ -258,6 +290,7 @@ async def finalize_media_group(context: ContextTypes.DEFAULT_TYPE, key: str):
                 parse_mode=ParseMode.HTML,
                 reply_to_message_id=first_id,
             )
+
     except Exception as e:
         log.exception("Failed to send converted album: %s", e)
 
@@ -299,12 +332,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if OWNER_USER_ID_INT and update.effective_user.id != OWNER_USER_ID_INT:
         return
 
-    # se non configurato output, avvisa
     if not OUTPUT_CHAT_ID_INT:
-        await msg.reply_text("⚠️ OUTPUT_CHAT_ID non impostato. Impostalo nelle variabili di Railway.")
+        await msg.reply_text("⚠️ OUTPUT_CHAT_ID non impostato (Railway Variables).")
         return
 
-    # ALBUM: raccogli solo foto
+    # ALBUM: raccogli solo foto (video ignorati)
     if msg.media_group_id:
         key = str(msg.media_group_id)
         async with LOCK:
@@ -324,10 +356,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buf.task = asyncio.create_task(finalize_media_group(context, key))
         return
 
-    # VIDEO singolo: ignoralo (se ha caption, convertila e manda solo testo)
+    # VIDEO singolo: ignoralo (se ha caption, manda solo testo convertito)
     if msg.video:
         if msg.caption_html:
-            rewritten, changed = rewrite_html_message(msg.caption_html)
+            rewritten, changed = rewrite_html_message_safe(msg.caption_html)
             if changed:
                 await send_daily_header_if_needed(context)
                 sent = await context.bot.send_message(
@@ -348,17 +380,32 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.photo:
         await send_daily_header_if_needed(context)
 
-        cap = msg.caption_html or ""
         rewritten_cap = None
-        if cap:
-            rewritten_cap, _ = rewrite_html_message(cap)
+        if msg.caption_html:
+            rewritten_cap, _ = rewrite_html_message_safe(msg.caption_html)
 
-        sent = await context.bot.send_photo(
-            chat_id=OUTPUT_CHAT_ID_INT,
-            photo=msg.photo[-1].file_id,
-            caption=(rewritten_cap if rewritten_cap else None),
-            parse_mode=(ParseMode.HTML if rewritten_cap else None),
-        )
+        try:
+            sent = await context.bot.send_photo(
+                chat_id=OUTPUT_CHAT_ID_INT,
+                photo=msg.photo[-1].file_id,
+                caption=(rewritten_cap if rewritten_cap else None),
+                parse_mode=(ParseMode.HTML if rewritten_cap else None),
+            )
+        except BadRequest as e:
+            # fallback: manda foto senza caption, poi caption separata
+            sent = await context.bot.send_photo(
+                chat_id=OUTPUT_CHAT_ID_INT,
+                photo=msg.photo[-1].file_id,
+            )
+            if rewritten_cap:
+                await context.bot.send_message(
+                    chat_id=OUTPUT_CHAT_ID_INT,
+                    text=rewritten_cap,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_to_message_id=sent.message_id,
+                )
+
         await context.bot.send_message(
             chat_id=OUTPUT_CHAT_ID_INT,
             text="🟣 <b>CONVERTITO</b>",
@@ -369,9 +416,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # TESTO
     if msg.text_html:
-        rewritten, changed = rewrite_html_message(msg.text_html)
+        rewritten, changed = rewrite_html_message_safe(msg.text_html)
         if not changed:
-            return  # non sporcare se non c'è nulla da cambiare
+            return
         await send_daily_header_if_needed(context)
         sent = await context.bot.send_message(
             chat_id=OUTPUT_CHAT_ID_INT,
@@ -387,7 +434,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Hardening timeout rete (evita i timeout random su Railway)
+    request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
+
+    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle))
