@@ -32,6 +32,10 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("cc-rewriter-clean")
+# Riduce lo spam dei log (polling = getUpdates continui)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_USER_ID = os.getenv("OWNER_USER_ID")
