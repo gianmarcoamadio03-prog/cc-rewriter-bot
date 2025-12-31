@@ -1,2 +1,4 @@
 python-telegram-bot==22.5
 python-dotenv==1.2.1
+aiolimiter==1.2.1
+
