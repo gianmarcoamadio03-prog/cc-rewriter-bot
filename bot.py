@@ -5,7 +5,6 @@ import json
 import asyncio
 import random
 import logging
-import hashlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
@@ -241,18 +240,6 @@ def html_to_plain_with_links(html_text: str, max_len: int = 2048) -> str:
     return t
 
 # =========================
-# Anti-duplicate (fast)
-# =========================
-def sha1_fingerprint(text: str, photos: List[str]) -> str:
-    h = hashlib.sha1()
-    h.update((text or "").encode("utf-8", errors="ignore"))
-    for p in photos[:2]:
-        h.update(p.encode("utf-8", errors="ignore"))
-    return h.hexdigest()
-
-PUBLISHED: set[str] = set()
-
-# =========================
 # SEND QUEUE
 # =========================
 SEND_QUEUE: asyncio.Queue[dict] = asyncio.Queue(maxsize=QUEUE_MAX)
@@ -385,11 +372,6 @@ async def finalize_media_group(key: str):
         if cap_src:
             cap_html, _ = rewrite_html_message_safe(cap_src)
             cap_plain = html_to_plain_with_links(cap_html, max_len=4096)
-
-        fp = sha1_fingerprint(cap_plain or cap_src, photos)
-        if fp in PUBLISHED:
-            return
-        PUBLISHED.add(fp)
 
         await enqueue({
             "kind": "album",
@@ -671,11 +653,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cap_html, _ = rewrite_html_message_safe(msg.caption_html)
             cap_plain = html_to_plain_with_links(cap_html, max_len=4096)
 
-        fp = sha1_fingerprint(cap_plain or msg.caption or "", [msg.photo[-1].file_id])
-        if fp in PUBLISHED:
-            return
-        PUBLISHED.add(fp)
-
         await enqueue({
             "kind": "photo",
             "photo": msg.photo[-1].file_id,
@@ -690,11 +667,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not changed:
             return
         plain = html_to_plain_with_links(rewritten_html, max_len=4096)
-
-        fp = sha1_fingerprint(plain, [])
-        if fp in PUBLISHED:
-            return
-        PUBLISHED.add(fp)
 
         await enqueue({"kind": "text", "text_html": rewritten_html, "text_plain": plain})
         return
