@@ -36,11 +36,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 log = logging.getLogger("cc-top")
 
+
 def must_env(name: str) -> str:
     v = os.getenv(name)
     if v is None or not str(v).strip():
         raise RuntimeError(f"Missing env var: {name}")
     return str(v).strip()
+
 
 BOT_TOKEN = must_env("BOT_TOKEN")
 OWNER_USER_ID_INT = int(must_env("OWNER_USER_ID"))
@@ -54,31 +56,28 @@ MULEBUY_REF = os.getenv("MULEBUY_REF", "200836051")
 CNFANS_REF = os.getenv("CNFANS_REF", "222394")
 
 # perf / behavior
-MAX_PHOTOS = int(os.getenv("MAX_PHOTOS", "4"))  # max foto per post (album)
-MEDIA_GROUP_WAIT = float(os.getenv("MEDIA_GROUP_WAIT", "0.7"))  # debounce album
-MAX_ALBUM_AGE = float(os.getenv("MAX_ALBUM_AGE", "6.0"))  # watchdog album (anti-stallo)
+MAX_PHOTOS = int(os.getenv("MAX_PHOTOS", "4"))                 # max foto per post (album)
+MEDIA_GROUP_WAIT = float(os.getenv("MEDIA_GROUP_WAIT", "0.7")) # debounce album
+MAX_ALBUM_AGE = float(os.getenv("MAX_ALBUM_AGE", "6.0"))       # watchdog album
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "2000"))
 
 # rates (separati: testo vs media)
-TEXT_RATE = float(os.getenv("TEXT_RATE", "12"))     # msg di testo/sec
-MEDIA_RATE = float(os.getenv("MEDIA_RATE", "5"))    # media/sec
-# (BURST è opzionale, ma aiolimiter è già abbastanza “smooth”; lo teniamo solo per compatibilità env)
-TEXT_BURST = int(os.getenv("TEXT_BURST", "12"))
-MEDIA_BURST = int(os.getenv("MEDIA_BURST", "5"))
+TEXT_RATE = float(os.getenv("TEXT_RATE", "12"))   # msg testo/sec
+MEDIA_RATE = float(os.getenv("MEDIA_RATE", "5"))  # media/sec
 
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "60"))
 
 # batch log
-BATCH_WAIT = float(os.getenv("BATCH_WAIT", "3.5"))      # fallback timer
+BATCH_WAIT = float(os.getenv("BATCH_WAIT", "3.5"))          # fallback timer
 PAIR_WINDOW = float(os.getenv("PAIR_WINDOW", "10.0"))
-BATCH_MIN_MESSAGES = int(os.getenv("BATCH_MIN_MESSAGES", "1"))  # 1 => sempre
+BATCH_MIN_MESSAGES = int(os.getenv("BATCH_MIN_MESSAGES", "1"))
 
 # caption/text safety
 ALBUM_CAPTION_LIMIT = int(os.getenv("ALBUM_CAPTION_LIMIT", "950"))
 PHOTO_CAPTION_LIMIT = int(os.getenv("PHOTO_CAPTION_LIMIT", "950"))
 TEXT_LIMIT = int(os.getenv("TEXT_LIMIT", "3900"))
 
-# ✅ NEW: idle window per mandare UNA sola conferma per raffica
+# ✅ una sola conferma per raffica (stessa sorgente) dopo idle
 FAST_FINALIZE_IDLE = float(os.getenv("FAST_FINALIZE_IDLE", "1.5"))
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
@@ -95,6 +94,7 @@ def load_state() -> dict:
     except Exception:
         return {}
 
+
 def save_state(state: dict) -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -102,10 +102,13 @@ def save_state(state: dict) -> None:
     except Exception:
         pass
 
+
 STATE = load_state()
+
 
 def today_str() -> str:
     return datetime.now(ZONE).strftime("%d/%m/%Y")
+
 
 async def send_daily_header_if_needed(bot) -> None:
     if os.getenv("DAILY_HEADER", "0") != "1":
@@ -137,12 +140,13 @@ async def tg_retry(coro_factory, retries: int = 8, base_sleep: float = 0.8):
     return await coro_factory()
 
 # =========================
-# URL rewrite (Mulebuy/CNFANS)
+# URL rewrite (FORZA SOLO REF)
 # =========================
 URL_RE = re.compile(r"(https?://[^\s<>\]]+)", re.IGNORECASE)
 HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
 A_TAG_RE = re.compile(r'<a\s+href="([^"]+)">(.+?)</a>', re.IGNORECASE | re.DOTALL)
 TRAILING_PUNCT = ".,;:!?)\u201d\u2019]"
+
 
 def strip_trailing_punct(url: str):
     trail = ""
@@ -151,58 +155,53 @@ def strip_trailing_punct(url: str):
         url = url[:-1]
     return url, trail
 
+
 def normalize_netloc(netloc: str) -> str:
-    return netloc.lower().lstrip("www.")
+    # gestisce www. e m.
+    n = (netloc or "").lower()
+    if n.startswith("www."):
+        n = n[4:]
+    if n.startswith("m."):
+        n = n[2:]
+    return n
+
 
 def rebuild_url(p, new_query: str) -> str:
     return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+
 
 def transform_mulebuy(url: str) -> str:
     p = urlparse(url)
     if normalize_netloc(p.netloc) != "mulebuy.com":
         return url
-    if not p.path.startswith("/product"):
-        return url
-    q = list(parse_qsl(p.query, keep_blank_values=True))
-    q = [(k, v) for (k, v) in q if k.lower() != "ref"]
-    q.append(("ref", MULEBUY_REF))
-    return rebuild_url(p, urlencode(q, doseq=True))
+
+    # gestisce ref doppi: parse come lista
+    qlist = list(parse_qsl(p.query, keep_blank_values=True))
+    # rimuovi TUTTI i ref esistenti
+    qlist = [(k, v) for (k, v) in qlist if k.lower() != "ref"]
+    # aggiungi SEMPRE il tuo
+    qlist.append(("ref", MULEBUY_REF))
+
+    return rebuild_url(p, urlencode(qlist, doseq=True))
+
 
 def transform_cnfans(url: str) -> str:
     p = urlparse(url)
     if normalize_netloc(p.netloc) != "cnfans.com":
         return url
-    if not p.path.startswith("/product"):
-        return url
 
-    q = list(parse_qsl(p.query, keep_blank_values=True))
-    q = [(k, v) for (k, v) in q if k.lower() != "ref"]
+    qlist = list(parse_qsl(p.query, keep_blank_values=True))
+    qlist = [(k, v) for (k, v) in qlist if k.lower() != "ref"]
+    qlist.append(("ref", CNFANS_REF))
 
-    platform = None
-    pid = None
-    others = []
-    for k, v in q:
-        kl = k.lower()
-        if kl == "platform" and platform is None:
-            platform = v
-        elif kl == "id" and pid is None:
-            pid = v
-        else:
-            others.append((k, v))
+    return rebuild_url(p, urlencode(qlist, doseq=True))
 
-    ordered = []
-    if platform is not None:
-        ordered.append(("platform", platform))
-    if pid is not None:
-        ordered.append(("id", pid))
-    ordered.append(("ref", CNFANS_REF))
-    ordered.extend(others)
-    return rebuild_url(p, urlencode(ordered, doseq=True))
 
 def transform_url(url: str) -> str:
     out = transform_mulebuy(url)
     out = transform_cnfans(out)
     return out
+
 
 def rewrite_html_message_safe(html_text: str) -> tuple[str, bool]:
     changed = False
@@ -227,10 +226,11 @@ def rewrite_html_message_safe(html_text: str) -> tuple[str, bool]:
             changed = True
         return html.escape(new, quote=False) + trail
 
-    for i in range(0, len(parts), 2):
+    for i in range(0, len(parts), 2):  # solo testo
         parts[i] = URL_RE.sub(repl_visible, parts[i])
 
     return "".join(parts), changed
+
 
 def html_to_plain_with_links(html_text: str, max_len: int = 2048) -> str:
     if not html_text:
@@ -252,6 +252,7 @@ def html_to_plain_with_links(html_text: str, max_len: int = 2048) -> str:
         t = t[: max_len - 1] + "…"
     return t
 
+
 def truncate_text(s: str, limit: int) -> str:
     if not s:
         return ""
@@ -262,20 +263,17 @@ def truncate_text(s: str, limit: int) -> str:
 # =========================
 # Priority SEND QUEUE
 # =========================
-# Priority: 0 = system (header, batch end), 10 = normal posts
 SEND_QUEUE: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=QUEUE_MAX)
 SENDER_TASK: Optional[asyncio.Task] = None
 SEQ = 0
 SEQ_LOCK = asyncio.Lock()
 
-# Limiter per rate (token/sec). aiolimiter è smooth e funziona bene.
-# (BURST lo teniamo per compatibilità ma usiamo RATE come base reale)
 TEXT_LIMITER = AsyncLimiter(max(int(TEXT_RATE), 1), 1.0)
 MEDIA_LIMITER = AsyncLimiter(max(int(MEDIA_RATE), 1), 1.0)
 
-# pending jobs per source (per batch deterministico)
 PENDING_JOBS: Dict[str, int] = {}
 PENDING_LOCK = asyncio.Lock()
+
 
 async def enqueue(job: dict, source_key: str, priority: int = 10):
     global SEQ
@@ -290,6 +288,7 @@ async def enqueue(job: dict, source_key: str, priority: int = 10):
 
     await SEND_QUEUE.put((priority, seq, job))
 
+
 async def _pending_done(source_key: str):
     async with PENDING_LOCK:
         cur = PENDING_JOBS.get(source_key, 0)
@@ -297,6 +296,7 @@ async def _pending_done(source_key: str):
             PENDING_JOBS.pop(source_key, None)
         else:
             PENDING_JOBS[source_key] = cur - 1
+
 
 async def sender_loop(app):
     bot = app.bot
@@ -379,8 +379,8 @@ async def sender_loop(app):
         finally:
             await _pending_done(source_key)
             SEND_QUEUE.task_done()
-            # prova a chiudere batch (ma solo quando è idle abbastanza, così esce UNA volta)
             asyncio.create_task(try_finalize_batch_fast(source_key))
+
 
 async def post_init(app):
     global SENDER_TASK
@@ -412,16 +412,18 @@ def extract_forward_source(msg) -> tuple[str, str]:
 
     fuser = getattr(msg, "forward_from", None)
     if fuser:
-        label = f"@{fuser.username}" if getattr(fuser, "username", None) else (fuser.full_name or f"User {fuser.id}")
+        label = f"@{fuser.username}" if getattr(fuser, "username", None) else (fuser.full_name or f"User {user.id}")
         return f"user:{fuser.id}", label
 
     return "hidden", "Origine nascosta (forward anonimo)"
+
 
 def is_forward(msg) -> bool:
     return bool(
         getattr(msg, "forward_origin", None) or getattr(msg, "forward_date", None) or
         getattr(msg, "forward_from", None) or getattr(msg, "forward_from_chat", None)
     )
+
 
 def msg_source(msg) -> Tuple[str, str]:
     if is_forward(msg):
@@ -442,8 +444,10 @@ class MediaGroupBuffer:
     last_ts: float = 0.0
     task: Optional[asyncio.Task] = None
 
+
 BUFFERS: Dict[str, MediaGroupBuffer] = {}
 LOCK = asyncio.Lock()
+
 
 async def finalize_media_group(key: str):
     try:
@@ -462,15 +466,12 @@ async def finalize_media_group(key: str):
                     BUFFERS.pop(key, None)
                     break
 
-        # unique + RANDOM max 4
         unique_photos = list(dict.fromkeys(buf.photo_file_ids))
         if not unique_photos:
             return
 
-        if len(unique_photos) > MAX_PHOTOS:
-            photos = random.sample(unique_photos, MAX_PHOTOS)
-        else:
-            photos = unique_photos
+        # ✅ max 4 random
+        photos = random.sample(unique_photos, MAX_PHOTOS) if len(unique_photos) > MAX_PHOTOS else unique_photos
 
         cap_html = None
         cap_plain = None
@@ -504,8 +505,10 @@ def emoji_for_source(source_key: str) -> str:
     palette = ["🟣","🟢","🟠","🔵","🔴","🟡","🟤","⚫️"]
     return palette[abs(hash(source_key)) % len(palette)]
 
+
 def make_batch_id() -> str:
     return "".join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
+
 
 @dataclass
 class BatchBuffer:
@@ -527,12 +530,15 @@ class BatchBuffer:
     task: Optional[asyncio.Task] = None
     finalized: bool = False
 
+
 BATCHES: Dict[str, BatchBuffer] = {}
 BATCH_LOCK = asyncio.Lock()
+
 
 async def finalize_batch(key: str):
     await asyncio.sleep(BATCH_WAIT)
     await finalize_batch_now(key, reason="timer")
+
 
 async def finalize_batch_now(key: str, reason: str = "fast"):
     async with BATCH_LOCK:
@@ -541,7 +547,6 @@ async def finalize_batch_now(key: str, reason: str = "fast"):
             return
 
         now = asyncio.get_event_loop().time()
-        # ✅ allineato alla logica idle: evita finalize prematuro
         if reason != "timer" and (now - b.last_ts) < FAST_FINALIZE_IDLE:
             return
 
@@ -587,29 +592,24 @@ async def finalize_batch_now(key: str, reason: str = "fast"):
         priority=0
     )
 
+
 async def try_finalize_batch_fast(source_key: str):
-    """
-    ✅ Chiude UNA SOLA VOLTA quando:
-      - pending jobs == 0
-      - nessun album buffer aperto per la sorgente
-      - e la sorgente è "idle" da FAST_FINALIZE_IDLE secondi (così non spezza la raffica)
-    """
-    # piccola pausa anti-race
+    # anti-race
     await asyncio.sleep(0.2)
 
-    # 1) pending jobs deve essere 0
+    # pending jobs deve essere 0
     async with PENDING_LOCK:
         pending = PENDING_JOBS.get(source_key, 0)
     if pending != 0:
         return
 
-    # 2) nessun album ancora aperto
+    # nessun album buffer aperto
     async with LOCK:
         for buf in BUFFERS.values():
             if buf.source_key == source_key:
                 return
 
-    # 3) batch deve esistere e deve essere idle abbastanza
+    # aspetta idle reale
     while True:
         async with BATCH_LOCK:
             b = BATCHES.get(source_key)
@@ -621,10 +621,8 @@ async def try_finalize_batch_fast(source_key: str):
         if idle >= FAST_FINALIZE_IDLE:
             break
 
-        # aspetta quel che manca, poi ricontrolla (loop safe)
         await asyncio.sleep((FAST_FINALIZE_IDLE - idle) + 0.15)
 
-        # ricontrolla anche pending/album nel mentre
         async with PENDING_LOCK:
             pending = PENDING_JOBS.get(source_key, 0)
         if pending != 0:
@@ -636,6 +634,7 @@ async def try_finalize_batch_fast(source_key: str):
                     return
 
     await finalize_batch_now(source_key, reason="fast")
+
 
 async def batch_touch(msg):
     if not is_forward(msg):
@@ -691,9 +690,10 @@ async def batch_touch(msg):
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Bot attivo (conversione link + queue + batch log).",
+        "✅ Bot attivo (conversione ref cnfans/mulebuy + queue + batch log).",
         disable_web_page_preview=True,
     )
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_USER_ID_INT:
@@ -719,6 +719,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
+
 async def cmd_lastbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_USER_ID_INT:
         return
@@ -737,6 +738,7 @@ async def cmd_lastbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(txt, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
+
 async def cmd_flush(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_USER_ID_INT:
         return
@@ -744,6 +746,7 @@ async def cmd_flush(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in keys:
         await finalize_batch_now(k, reason="manual-flush")
     await update.message.reply_text("✅ Batch chiusi manualmente (/flush).")
+
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -826,7 +829,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }, source_key=source_key, priority=10)
         return
 
-    # Testo: pubblica SOLO se c’è conversione link
+    # Testo: pubblica SOLO se c’è almeno una modifica (ref forzato)
     if msg.text_html:
         rewritten_html, changed = rewrite_html_message_safe(msg.text_html)
         if not changed:
@@ -877,12 +880,13 @@ def main():
     app.add_handler(CommandHandler("flush", cmd_flush))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle))
 
-    log.info("Bot running (final: single-confirm + fast + stable)...")
+    log.info("Bot running (force-ref only: mulebuy + cnfans)...")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
         close_loop=False,
     )
+
 
 if __name__ == "__main__":
     main()
