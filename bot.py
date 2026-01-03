@@ -60,22 +60,26 @@ MAX_ALBUM_AGE = float(os.getenv("MAX_ALBUM_AGE", "6.0"))  # watchdog album (anti
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "2000"))
 
 # rates (separati: testo vs media)
-TEXT_RATE = float(os.getenv("TEXT_RATE", "12"))     # msg di testo/sec (più alto)
-MEDIA_RATE = float(os.getenv("MEDIA_RATE", "5"))    # media/sec (più basso = meno 429)
+TEXT_RATE = float(os.getenv("TEXT_RATE", "12"))     # msg di testo/sec
+MEDIA_RATE = float(os.getenv("MEDIA_RATE", "5"))    # media/sec
+# (BURST è opzionale, ma aiolimiter è già abbastanza “smooth”; lo teniamo solo per compatibilità env)
 TEXT_BURST = int(os.getenv("TEXT_BURST", "12"))
 MEDIA_BURST = int(os.getenv("MEDIA_BURST", "5"))
 
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "60"))
 
 # batch log
-BATCH_WAIT = float(os.getenv("BATCH_WAIT", "3.5"))      # fallback timer (ora più basso)
+BATCH_WAIT = float(os.getenv("BATCH_WAIT", "3.5"))      # fallback timer
 PAIR_WINDOW = float(os.getenv("PAIR_WINDOW", "10.0"))
 BATCH_MIN_MESSAGES = int(os.getenv("BATCH_MIN_MESSAGES", "1"))  # 1 => sempre
 
 # caption/text safety
-ALBUM_CAPTION_LIMIT = int(os.getenv("ALBUM_CAPTION_LIMIT", "950"))  # safe under 1024
+ALBUM_CAPTION_LIMIT = int(os.getenv("ALBUM_CAPTION_LIMIT", "950"))
 PHOTO_CAPTION_LIMIT = int(os.getenv("PHOTO_CAPTION_LIMIT", "950"))
-TEXT_LIMIT = int(os.getenv("TEXT_LIMIT", "3900"))  # safe under 4096
+TEXT_LIMIT = int(os.getenv("TEXT_LIMIT", "3900"))
+
+# ✅ NEW: idle window per mandare UNA sola conferma per raffica
+FAST_FINALIZE_IDLE = float(os.getenv("FAST_FINALIZE_IDLE", "1.5"))
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
@@ -104,7 +108,6 @@ def today_str() -> str:
     return datetime.now(ZONE).strftime("%d/%m/%Y")
 
 async def send_daily_header_if_needed(bot) -> None:
-    # opzionale: header giornaliero nel gruppo
     if os.getenv("DAILY_HEADER", "0") != "1":
         return
     key = f"last_header:{OUTPUT_CHAT_ID_INT}"
@@ -224,7 +227,7 @@ def rewrite_html_message_safe(html_text: str) -> tuple[str, bool]:
             changed = True
         return html.escape(new, quote=False) + trail
 
-    for i in range(0, len(parts), 2):  # solo testo
+    for i in range(0, len(parts), 2):
         parts[i] = URL_RE.sub(repl_visible, parts[i])
 
     return "".join(parts), changed
@@ -265,17 +268,16 @@ SENDER_TASK: Optional[asyncio.Task] = None
 SEQ = 0
 SEQ_LOCK = asyncio.Lock()
 
-TEXT_LIMITER = AsyncLimiter(max(TEXT_BURST, 1), 1.0)
-MEDIA_LIMITER = AsyncLimiter(max(MEDIA_BURST, 1), 1.0)
+# Limiter per rate (token/sec). aiolimiter è smooth e funziona bene.
+# (BURST lo teniamo per compatibilità ma usiamo RATE come base reale)
+TEXT_LIMITER = AsyncLimiter(max(int(TEXT_RATE), 1), 1.0)
+MEDIA_LIMITER = AsyncLimiter(max(int(MEDIA_RATE), 1), 1.0)
 
 # pending jobs per source (per batch deterministico)
 PENDING_JOBS: Dict[str, int] = {}
 PENDING_LOCK = asyncio.Lock()
 
 async def enqueue(job: dict, source_key: str, priority: int = 10):
-    """
-    source_key serve per chiudere il batch appena finisce davvero.
-    """
     global SEQ
     async with SEQ_LOCK:
         SEQ += 1
@@ -303,13 +305,11 @@ async def sender_loop(app):
         source_key = job.get("source_key", "unknown")
 
         try:
-            # header giornaliero: testo (solo 1 volta al giorno)
             async with TEXT_LIMITER:
                 await tg_retry(lambda: send_daily_header_if_needed(bot))
 
             kind = job.get("kind")
 
-            # ====== MEDIA GROUP ======
             if kind == "album":
                 photos: List[str] = job.get("photos", [])
                 cap_html: Optional[str] = job.get("caption_html")
@@ -325,7 +325,6 @@ async def sender_loop(app):
                                 media.append(InputMediaPhoto(media=fid))
                         await tg_retry(lambda: bot.send_media_group(chat_id=OUTPUT_CHAT_ID_INT, media=media))
                     except BadRequest:
-                        # fallback plain
                         media2 = []
                         for i, fid in enumerate(photos):
                             if i == 0 and cap_plain:
@@ -334,7 +333,6 @@ async def sender_loop(app):
                                 media2.append(InputMediaPhoto(media=fid))
                         await tg_retry(lambda: bot.send_media_group(chat_id=OUTPUT_CHAT_ID_INT, media=media2))
 
-            # ====== PHOTO ======
             elif kind == "photo":
                 fid = job["photo"]
                 cap_html = job.get("caption_html")
@@ -355,7 +353,6 @@ async def sender_loop(app):
                             caption=(cap_plain if cap_plain else None),
                         ))
 
-            # ====== TEXT ======
             elif kind == "text":
                 html_txt = job["text_html"]
                 plain_txt = job["text_plain"]
@@ -382,7 +379,7 @@ async def sender_loop(app):
         finally:
             await _pending_done(source_key)
             SEND_QUEUE.task_done()
-            # prova a chiudere batch subito se finito davvero
+            # prova a chiudere batch (ma solo quando è idle abbastanza, così esce UNA volta)
             asyncio.create_task(try_finalize_batch_fast(source_key))
 
 async def post_init(app):
@@ -482,7 +479,6 @@ async def finalize_media_group(key: str):
             cap_html2, _ = rewrite_html_message_safe(cap_src)
             cap_plain2 = html_to_plain_with_links(cap_html2, max_len=TEXT_LIMIT)
 
-            # caption safe: prefer HTML only if short enough; else plain
             cap_plain2 = truncate_text(cap_plain2, ALBUM_CAPTION_LIMIT)
             if len(cap_html2) <= ALBUM_CAPTION_LIMIT:
                 cap_html = cap_html2
@@ -502,7 +498,7 @@ async def finalize_media_group(key: str):
         log.exception("finalize_media_group failed: %s", e)
 
 # =========================
-# BATCH TRACKER (raffiche + “post vs msg”)
+# BATCH TRACKER
 # =========================
 def emoji_for_source(source_key: str) -> str:
     palette = ["🟣","🟢","🟠","🔵","🔴","🟡","🟤","⚫️"]
@@ -535,7 +531,6 @@ BATCHES: Dict[str, BatchBuffer] = {}
 BATCH_LOCK = asyncio.Lock()
 
 async def finalize_batch(key: str):
-    # fallback timer-based finalize (rimane, ma ora c’è anche il fast finalize)
     await asyncio.sleep(BATCH_WAIT)
     await finalize_batch_now(key, reason="timer")
 
@@ -546,14 +541,13 @@ async def finalize_batch_now(key: str, reason: str = "fast"):
             return
 
         now = asyncio.get_event_loop().time()
-        # se è arrivato un msg appena ora, aspetta ancora un attimo
-        if reason != "timer" and (now - b.last_ts) < 0.25:
+        # ✅ allineato alla logica idle: evita finalize prematuro
+        if reason != "timer" and (now - b.last_ts) < FAST_FINALIZE_IDLE:
             return
 
         b.finalized = True
         BATCHES.pop(key, None)
 
-    # se è rimasto un testo non accoppiato -> post testo-only
     if b.pending_text_ts is not None:
         b.posts += 1
         b.pending_text_ts = None
@@ -587,7 +581,6 @@ async def finalize_batch_now(key: str, reason: str = "fast"):
     plain = truncate_text(plain, TEXT_LIMIT)
     txt = truncate_text(txt, TEXT_LIMIT)
 
-    # PRIORITY 0: sistema (arriva subito)
     await enqueue(
         {"kind": "text", "text_html": txt, "text_plain": plain},
         source_key=key,
@@ -596,27 +589,52 @@ async def finalize_batch_now(key: str, reason: str = "fast"):
 
 async def try_finalize_batch_fast(source_key: str):
     """
-    Chiude subito appena:
-      - non ci sono pending jobs per quella sorgente
-      - non ci sono album buffer aperti per quella sorgente
-      - e il batch esiste
+    ✅ Chiude UNA SOLA VOLTA quando:
+      - pending jobs == 0
+      - nessun album buffer aperto per la sorgente
+      - e la sorgente è "idle" da FAST_FINALIZE_IDLE secondi (così non spezza la raffica)
     """
-    # piccola pausa per evitare race con enqueue appena fatto
+    # piccola pausa anti-race
     await asyncio.sleep(0.2)
 
+    # 1) pending jobs deve essere 0
     async with PENDING_LOCK:
         pending = PENDING_JOBS.get(source_key, 0)
-
     if pending != 0:
         return
 
-    # controlla se ci sono album ancora aperti per quella sorgente
+    # 2) nessun album ancora aperto
     async with LOCK:
         for buf in BUFFERS.values():
             if buf.source_key == source_key:
                 return
 
-    # se c'è un batch attivo, chiudilo ora
+    # 3) batch deve esistere e deve essere idle abbastanza
+    while True:
+        async with BATCH_LOCK:
+            b = BATCHES.get(source_key)
+            if not b or b.finalized:
+                return
+            now = asyncio.get_event_loop().time()
+            idle = now - b.last_ts
+
+        if idle >= FAST_FINALIZE_IDLE:
+            break
+
+        # aspetta quel che manca, poi ricontrolla (loop safe)
+        await asyncio.sleep((FAST_FINALIZE_IDLE - idle) + 0.15)
+
+        # ricontrolla anche pending/album nel mentre
+        async with PENDING_LOCK:
+            pending = PENDING_JOBS.get(source_key, 0)
+        if pending != 0:
+            return
+
+        async with LOCK:
+            for buf in BUFFERS.values():
+                if buf.source_key == source_key:
+                    return
+
     await finalize_batch_now(source_key, reason="fast")
 
 async def batch_touch(msg):
@@ -673,8 +691,7 @@ async def batch_touch(msg):
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Bot attivo (conversione link + queue + batch log).\n"
-        "Inoltra in DM: pubblico nel gruppo e ti faccio riepilogo per ogni raffica.",
+        "✅ Bot attivo (conversione link + queue + batch log).",
         disable_web_page_preview=True,
     )
 
@@ -696,7 +713,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📦 Coda: {SEND_QUEUE.qsize()} / {QUEUE_MAX} | Pending: {pending_total}\n"
         f"⚙️ MAX_PHOTOS: {MAX_PHOTOS} | MEDIA_GROUP_WAIT: {MEDIA_GROUP_WAIT}s | MAX_ALBUM_AGE: {MAX_ALBUM_AGE}s\n"
-        f"🚀 TEXT_RATE: {TEXT_RATE}/s | MEDIA_RATE: {MEDIA_RATE}/s\n"
+        f"🚀 TEXT_RATE: {TEXT_RATE}/s | MEDIA_RATE: {MEDIA_RATE}/s | IDLE: {FAST_FINALIZE_IDLE}s\n"
         f"🧾 BATCH_WAIT(fallback): {BATCH_WAIT}s | PAIR_WINDOW: {PAIR_WINDOW}s"
         f"{last_line}",
         disable_web_page_preview=True,
@@ -749,12 +766,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_USER_ID_INT:
         return
 
-    # tracking batch (solo forward)
     await batch_touch(msg)
 
     source_key, source_label = msg_source(msg)
 
-    # Album buffer (foto)
+    # Album buffer
     if msg.media_group_id:
         key = str(msg.media_group_id)
         now = asyncio.get_event_loop().time()
@@ -818,7 +834,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         plain = html_to_plain_with_links(rewritten_html, max_len=TEXT_LIMIT)
 
-        # safety: se html troppo lungo, manda plain
         if len(rewritten_html) > TEXT_LIMIT:
             rewritten_html = None
             plain = truncate_text(plain, TEXT_LIMIT)
@@ -844,7 +859,6 @@ def main():
         pool_timeout=HTTP_TIMEOUT,
     )
 
-    # concorrenza ottimizzata: stabile, veloce, zero race inutili
     concurrent_updates = int(os.getenv("CONCURRENT_UPDATES", "12"))
 
     app = (
@@ -863,7 +877,7 @@ def main():
     app.add_handler(CommandHandler("flush", cmd_flush))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle))
 
-    log.info("Bot running (TOP config: fast + stable + album debounce + fast batch end)...")
+    log.info("Bot running (final: single-confirm + fast + stable)...")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
@@ -872,4 +886,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
