@@ -168,15 +168,6 @@ async def queue_count() -> int:
         return len(STATE["queue"])
 
 
-async def queue_stats() -> dict:
-    async with STATE_LOCK:
-        return {
-            "pending": len(STATE["queue"]),
-            "converted_total": STATE["stats"]["converted_total"],
-            "sent_total": STATE["stats"]["sent_total"],
-        }
-
-
 async def queue_mark_sent_and_remove(item_id: int) -> None:
     async with STATE_LOCK:
         new_queue = [x for x in STATE["queue"] if x.get("id") != item_id]
@@ -204,9 +195,7 @@ async def require_owner(update: Update) -> bool:
         return False
 
     if OWNER_USER_ID_INT is None:
-        await msg.reply_text(
-            "⚠️ OWNER_USER_ID non impostato nel .env."
-        )
+        await msg.reply_text("⚠️ OWNER_USER_ID non impostato nel .env.")
         return False
 
     if not owner_only(update):
@@ -614,7 +603,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Comandi:\n"
         "/totale\n"
         "/invio 50\n"
-        "/invio 80\n"
+        "/invia 50\n"
         "/id"
     )
 
@@ -627,11 +616,9 @@ async def cmd_totale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner_and_command_chat(update):
         return
 
-    stats = await queue_stats()
+    pending = await queue_count()
     await msg.reply_text(
-        f"📦 In coda in POST PRONTI: <b>{stats['pending']}</b>\n"
-        f"🔁 Convertiti totali: <b>{stats['converted_total']}</b>\n"
-        f"🚀 Inviati totali: <b>{stats['sent_total']}</b>",
+        f"📦 Post attualmente in coda in POST PRONTI: <b>{pending}</b>",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -830,7 +817,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler(["totale", "quanti"], cmd_totale))
-    app.add_handler(CommandHandler("invio", cmd_invio))
+    app.add_handler(CommandHandler(["invio", "invia"], cmd_invio))
 
     # input privato del bot
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_private_input))
