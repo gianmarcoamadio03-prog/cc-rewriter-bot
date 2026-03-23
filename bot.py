@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest, Forbidden
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -35,30 +36,55 @@ logging.basicConfig(
 )
 log = logging.getLogger("cc-rewriter-bot")
 
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-OWNER_USER_ID = (os.getenv("OWNER_USER_ID") or "").strip()
-OUTPUT_CHAT_ID = (os.getenv("OUTPUT_CHAT_ID") or "").strip()
-BEST_FIND_CHAT_ID = (os.getenv("BEST_FIND_CHAT_ID") or "").strip()
 
-MULEBUY_REF = (os.getenv("MULEBUY_REF") or "200836051").strip()
-CNFANS_REF = (os.getenv("CNFANS_REF") or "222394").strip()
+def env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
 
-TZ = (os.getenv("TZ") or "Europe/Rome").strip()
-MAX_PHOTOS = int((os.getenv("MAX_PHOTOS") or "4").strip())
-MEDIA_GROUP_WAIT = float((os.getenv("MEDIA_GROUP_WAIT") or "1.2").strip())
-STATE_FILE = (os.getenv("STATE_FILE") or "state.json").strip()
 
-TEXT_LIMIT = int((os.getenv("TEXT_LIMIT") or "3900").strip())
-PHOTO_CAPTION_LIMIT = int((os.getenv("PHOTO_CAPTION_LIMIT") or "950").strip())
+def env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    return int(raw)
 
+
+def env_float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    return float(raw)
+
+
+BOT_TOKEN = env_str("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Manca BOT_TOKEN nel .env")
 
-OWNER_USER_ID_INT = int(OWNER_USER_ID) if OWNER_USER_ID else None
-BEST_FIND_CHAT_ID_INT = (
-    int(BEST_FIND_CHAT_ID) if BEST_FIND_CHAT_ID
-    else (int(OUTPUT_CHAT_ID) if OUTPUT_CHAT_ID else None)
-)
+OWNER_USER_ID_INT = env_int("OWNER_USER_ID", None)
+
+# Gruppo coda interna: POST PRONTI
+POST_PRONTI_CHAT_ID_INT = env_int("POST_PRONTI_CHAT_ID", None)
+if POST_PRONTI_CHAT_ID_INT is None:
+    POST_PRONTI_CHAT_ID_INT = env_int("OUTPUT_CHAT_ID", None)
+
+# Destinazione finale: canale/gruppo pubblico
+FINAL_CHAT_ID_INT = env_int("BEST_FIND_CHAT_ID", None)
+if FINAL_CHAT_ID_INT is None:
+    FINAL_CHAT_ID_INT = env_int("FINAL_CHAT_ID", None)
+
+MULEBUY_REF = env_str("MULEBUY_REF", "200836051")
+CNFANS_REF = env_str("CNFANS_REF", "222394")
+
+TZ = env_str("TZ", "Europe/Rome")
+MAX_PHOTOS = env_int("MAX_PHOTOS", 4) or 4
+MEDIA_GROUP_WAIT = env_float("MEDIA_GROUP_WAIT", 1.2)
+HTTP_TIMEOUT = env_float("HTTP_TIMEOUT", 60.0)
+
+TEXT_LIMIT = env_int("TEXT_LIMIT", 3900) or 3900
+PHOTO_CAPTION_LIMIT = env_int("PHOTO_CAPTION_LIMIT", 950) or 950
+STATE_FILE = env_str("STATE_FILE", "state.json")
+
+SEND_DELAY_MIN = env_float("SEND_DELAY_MIN", 0.8)
+SEND_DELAY_MAX = env_float("SEND_DELAY_MAX", 1.8)
 
 ZONE = ZoneInfo(TZ)
 
@@ -69,6 +95,9 @@ URL_RE = re.compile(r"(https?://[^\s<>\]]+)", re.IGNORECASE)
 HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
 TRAILING_PUNCT = ".,;:!?)\u201d\u2019]"
 ID_CMD_RE = re.compile(r"^/id(?:@[A-Za-z0-9_]+)?$", re.IGNORECASE)
+CRAV_TEXT_RE = re.compile(
+    r"(?i)(?:https?://)?(?:www\.)?cravattacinese\.com"
+)
 
 
 # =========================
@@ -77,7 +106,7 @@ ID_CMD_RE = re.compile(r"^/id(?:@[A-Za-z0-9_]+)?$", re.IGNORECASE)
 def base_state() -> dict:
     return {
         "next_post_id": 1,
-        "pending_posts": [],
+        "queue": [],
         "stats": {
             "converted_total": 0,
             "sent_total": 0,
@@ -95,15 +124,15 @@ def load_state() -> dict:
     except Exception:
         return base_state()
 
-    out = base_state()
-    out.update(data or {})
-    out["stats"] = {**base_state()["stats"], **(out.get("stats") or {})}
-    out["pending_posts"] = out.get("pending_posts") or []
+    state = base_state()
+    state.update(data or {})
+    state["stats"] = {**base_state()["stats"], **(state.get("stats") or {})}
+    state["queue"] = state.get("queue") or []
 
-    if not isinstance(out.get("next_post_id"), int):
-        out["next_post_id"] = 1
+    if not isinstance(state.get("next_post_id"), int):
+        state["next_post_id"] = 1
 
-    return out
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -118,24 +147,43 @@ def now_iso() -> str:
     return datetime.now(ZONE).isoformat(timespec="seconds")
 
 
-async def add_pending_post(item: dict) -> int:
+async def queue_add(item: dict) -> int:
     async with STATE_LOCK:
         row = dict(item)
         row["id"] = STATE["next_post_id"]
         STATE["next_post_id"] += 1
-        STATE["pending_posts"].append(row)
+        STATE["queue"].append(row)
         STATE["stats"]["converted_total"] += 1
         save_state(STATE)
-        return len(STATE["pending_posts"])
+        return row["id"]
 
 
-async def get_stats() -> dict:
+async def queue_list_pending() -> List[dict]:
+    async with STATE_LOCK:
+        return list(STATE["queue"])
+
+
+async def queue_count() -> int:
+    async with STATE_LOCK:
+        return len(STATE["queue"])
+
+
+async def queue_stats() -> dict:
     async with STATE_LOCK:
         return {
-            "pending": len(STATE["pending_posts"]),
+            "pending": len(STATE["queue"]),
             "converted_total": STATE["stats"]["converted_total"],
             "sent_total": STATE["stats"]["sent_total"],
         }
+
+
+async def queue_mark_sent_and_remove(item_id: int) -> None:
+    async with STATE_LOCK:
+        new_queue = [x for x in STATE["queue"] if x.get("id") != item_id]
+        if len(new_queue) != len(STATE["queue"]):
+            STATE["queue"] = new_queue
+            STATE["stats"]["sent_total"] += 1
+            save_state(STATE)
 
 
 # =========================
@@ -144,9 +192,9 @@ async def get_stats() -> dict:
 def owner_only(update: Update) -> bool:
     user = update.effective_user
     return bool(
-        OWNER_USER_ID_INT is not None and
-        user is not None and
-        user.id == OWNER_USER_ID_INT
+        OWNER_USER_ID_INT is not None
+        and user is not None
+        and user.id == OWNER_USER_ID_INT
     )
 
 
@@ -157,12 +205,37 @@ async def require_owner(update: Update) -> bool:
 
     if OWNER_USER_ID_INT is None:
         await msg.reply_text(
-            "⚠️ OWNER_USER_ID non impostato.\n"
-            "Usa /id in privato col bot, copia il tuo User ID nel file .env come OWNER_USER_ID e riavvia il bot."
+            "⚠️ OWNER_USER_ID non impostato nel .env."
         )
         return False
 
     if not owner_only(update):
+        return False
+
+    return True
+
+
+def commands_chat_ok(update: Update) -> bool:
+    chat = update.effective_chat
+    if not chat:
+        return False
+    if chat.type == "private":
+        return True
+    return POST_PRONTI_CHAT_ID_INT is not None and chat.id == POST_PRONTI_CHAT_ID_INT
+
+
+async def require_owner_and_command_chat(update: Update) -> bool:
+    msg = update.effective_message
+    if not msg:
+        return False
+
+    if not await require_owner(update):
+        return False
+
+    if not commands_chat_ok(update):
+        await msg.reply_text(
+            "⚠️ Usa questo comando in privato oppure nel gruppo POST PRONTI."
+        )
         return False
 
     return True
@@ -176,6 +249,7 @@ def truncate_text(text: str, limit: int) -> str:
 
 async def with_retry(coro_factory, retries: int = 5):
     last_exc = None
+
     for attempt in range(1, retries + 1):
         try:
             return await coro_factory()
@@ -269,6 +343,21 @@ def transform_url(url: str) -> str:
     return out
 
 
+def normalize_visible_plain_text(text: str) -> tuple[str, bool]:
+    if not text:
+        return text, False
+
+    changed = False
+
+    def repl(match):
+        nonlocal changed
+        changed = True
+        return "www.cravattacinese.com"
+
+    out = CRAV_TEXT_RE.sub(repl, text)
+    return out, changed
+
+
 def rewrite_html_message_safe(html_text: str) -> tuple[str, bool]:
     if not html_text:
         return "", False
@@ -286,7 +375,7 @@ def rewrite_html_message_safe(html_text: str) -> tuple[str, bool]:
     out = HREF_RE.sub(href_repl, html_text)
     parts = re.split(r"(<[^>]+>)", out)
 
-    def repl_visible(match):
+    def repl_visible_url(match):
         nonlocal changed
         old_with_trail = match.group(1)
         old, trail = strip_trailing_punct(old_with_trail)
@@ -297,7 +386,11 @@ def rewrite_html_message_safe(html_text: str) -> tuple[str, bool]:
         return html.escape(new, quote=False) + trail
 
     for i in range(0, len(parts), 2):
-        parts[i] = URL_RE.sub(repl_visible, parts[i])
+        parts[i] = URL_RE.sub(repl_visible_url, parts[i])
+        normalized, text_changed = normalize_visible_plain_text(parts[i])
+        if text_changed:
+            changed = True
+            parts[i] = normalized
 
     return "".join(parts), changed
 
@@ -317,57 +410,102 @@ class MediaGroupBuffer:
 BUFFERS: Dict[str, MediaGroupBuffer] = {}
 
 
-async def finalize_media_group(key: str):
-    while True:
-        await asyncio.sleep(MEDIA_GROUP_WAIT)
+# =========================
+# HOLDING GROUP / POST PRONTI
+# =========================
+async def publish_to_post_pronti(bot, item: dict) -> List[int]:
+    if POST_PRONTI_CHAT_ID_INT is None:
+        raise RuntimeError("POST_PRONTI_CHAT_ID non configurato")
 
-        async with BUFFERS_LOCK:
-            buf = BUFFERS.get(key)
-            if not buf:
-                return
+    kind = item.get("kind")
 
-            idle = asyncio.get_running_loop().time() - buf.last_ts
-            if idle < MEDIA_GROUP_WAIT:
-                continue
+    if kind == "text":
+        msg = await with_retry(lambda: bot.send_message(
+            chat_id=POST_PRONTI_CHAT_ID_INT,
+            text=truncate_text(item.get("html", ""), TEXT_LIMIT),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        ))
+        return [msg.message_id]
 
-            BUFFERS.pop(key, None)
+    if kind == "album":
+        photos = list(dict.fromkeys(item.get("photos") or []))
+        caption_html = truncate_text(item.get("caption_html", ""), PHOTO_CAPTION_LIMIT)
 
-        unique_photos = list(dict.fromkeys(buf.photo_file_ids))
-        if not unique_photos:
-            return
+        if len(photos) == 1:
+            msg = await with_retry(lambda: bot.send_photo(
+                chat_id=POST_PRONTI_CHAT_ID_INT,
+                photo=photos[0],
+                caption=caption_html or None,
+                parse_mode=ParseMode.HTML if caption_html else None,
+            ))
+            return [msg.message_id]
 
-        photos = random.sample(unique_photos, MAX_PHOTOS) if len(unique_photos) > MAX_PHOTOS else unique_photos
+        media = []
+        for i, file_id in enumerate(photos[:MAX_PHOTOS]):
+            if i == 0 and caption_html:
+                media.append(InputMediaPhoto(
+                    media=file_id,
+                    caption=caption_html,
+                    parse_mode=ParseMode.HTML,
+                ))
+            else:
+                media.append(InputMediaPhoto(media=file_id))
 
-        caption_html = buf.caption_html or ""
-        rewritten_html, changed = rewrite_html_message_safe(caption_html)
+        msgs = await with_retry(lambda: bot.send_media_group(
+            chat_id=POST_PRONTI_CHAT_ID_INT,
+            media=media,
+        ))
+        return [m.message_id for m in msgs]
 
-        if not changed:
-            return
+    return []
 
-        await add_pending_post({
-            "kind": "album",
-            "photos": photos,
-            "caption_html": truncate_text(rewritten_html, PHOTO_CAPTION_LIMIT),
-            "created_at": now_iso(),
-        })
+
+async def delete_from_post_pronti(bot, message_ids: List[int]) -> None:
+    if POST_PRONTI_CHAT_ID_INT is None:
         return
 
+    for mid in message_ids or []:
+        try:
+            await with_retry(lambda mid=mid: bot.delete_message(
+                chat_id=POST_PRONTI_CHAT_ID_INT,
+                message_id=mid,
+            ))
+        except Exception:
+            log.exception("Impossibile cancellare message_id=%s da POST PRONTI", mid)
+
+
+async def queue_and_publish_to_post_pronti(bot, item: dict) -> bool:
+    try:
+        holding_ids = await publish_to_post_pronti(bot, item)
+    except Exception:
+        log.exception("Errore pubblicazione in POST PRONTI")
+        return False
+
+    if not holding_ids:
+        return False
+
+    item = dict(item)
+    item["holding_message_ids"] = holding_ids
+    item["created_at"] = now_iso()
+    await queue_add(item)
+    return True
+
 
 # =========================
-# SEND
+# FINAL SEND
 # =========================
-async def send_pending_item(bot, item: dict) -> bool:
+async def send_to_final_destination(bot, item: dict) -> bool:
+    if FINAL_CHAT_ID_INT is None:
+        return False
+
     kind = item.get("kind")
 
     try:
         if kind == "text":
-            text = truncate_text(item.get("html", ""), TEXT_LIMIT)
-            if not text:
-                return False
-
             await with_retry(lambda: bot.send_message(
-                chat_id=BEST_FIND_CHAT_ID_INT,
-                text=text,
+                chat_id=FINAL_CHAT_ID_INT,
+                text=truncate_text(item.get("html", ""), TEXT_LIMIT),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             ))
@@ -382,7 +520,7 @@ async def send_pending_item(bot, item: dict) -> bool:
 
             if len(photos) == 1:
                 await with_retry(lambda: bot.send_photo(
-                    chat_id=BEST_FIND_CHAT_ID_INT,
+                    chat_id=FINAL_CHAT_ID_INT,
                     photo=photos[0],
                     caption=caption_html or None,
                     parse_mode=ParseMode.HTML if caption_html else None,
@@ -401,7 +539,7 @@ async def send_pending_item(bot, item: dict) -> bool:
                     media.append(InputMediaPhoto(media=file_id))
 
             await with_retry(lambda: bot.send_media_group(
-                chat_id=BEST_FIND_CHAT_ID_INT,
+                chat_id=FINAL_CHAT_ID_INT,
                 media=media,
             ))
             return True
@@ -409,120 +547,19 @@ async def send_pending_item(bot, item: dict) -> bool:
         return False
 
     except Forbidden:
-        log.exception("Forbidden while sending item id=%s", item.get("id"))
+        log.exception("Forbidden while sending final item id=%s", item.get("id"))
         return False
     except BadRequest:
-        log.exception("BadRequest while sending item id=%s", item.get("id"))
+        log.exception("BadRequest while sending final item id=%s", item.get("id"))
         return False
     except Exception:
-        log.exception("Unexpected error while sending item id=%s", item.get("id"))
+        log.exception("Unexpected error while sending final item id=%s", item.get("id"))
         return False
 
 
 # =========================
-# COMMANDS
+# UNIVERSAL /id
 # =========================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg:
-        return
-
-    if OWNER_USER_ID_INT is None:
-        await msg.reply_text(
-            "✅ Bot avviato.\n"
-            "Prima configurazione:\n"
-            "1) usa /id in privato col bot per leggere il tuo User ID\n"
-            "2) mettilo nel file .env come OWNER_USER_ID\n"
-            "3) usa /id nel gruppo o canale per leggere il Chat ID\n"
-            "4) mettilo nel file .env come BEST_FIND_CHAT_ID oppure OUTPUT_CHAT_ID\n"
-            "5) riavvia il bot"
-        )
-        return
-
-    if not owner_only(update):
-        return
-
-    await msg.reply_text(
-        "✅ Bot attivo.\n"
-        "Inoltrami i post in privato.\n"
-        "/totale = quanti ha convertito e quanti sono in coda\n"
-        "/invio = invia la coda nel gruppo/canale in ordine casuale\n"
-        "/id = mostra User ID e Chat ID della chat corrente",
-        disable_web_page_preview=True,
-    )
-
-
-async def cmd_totale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg:
-        return
-
-    if not await require_owner(update):
-        return
-
-    stats = await get_stats()
-    await msg.reply_text(
-        f"📦 In coda: <b>{stats['pending']}</b>\n"
-        f"🔁 Convertiti totali: <b>{stats['converted_total']}</b>\n"
-        f"🚀 Inviati totali: <b>{stats['sent_total']}</b>",
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-
-
-async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg:
-        return
-
-    if not await require_owner(update):
-        return
-
-    if BEST_FIND_CHAT_ID_INT is None:
-        await msg.reply_text(
-            "⚠️ BEST_FIND_CHAT_ID / OUTPUT_CHAT_ID non impostato.\n"
-            "Usa /id nel gruppo o canale di destinazione, copia il Chat ID nel file .env e riavvia il bot."
-        )
-        return
-
-    async with STATE_LOCK:
-        pending = list(STATE["pending_posts"])
-
-    if not pending:
-        await msg.reply_text("📭 Nessun post in coda da inviare.")
-        return
-
-    random.shuffle(pending)
-
-    sent_ids = set()
-    sent_ok = 0
-
-    for item in pending:
-        ok = await send_pending_item(context.bot, item)
-        if ok:
-            sent_ids.add(item["id"])
-            sent_ok += 1
-
-    async with STATE_LOCK:
-        if sent_ids:
-            STATE["pending_posts"] = [
-                row for row in STATE["pending_posts"]
-                if row.get("id") not in sent_ids
-            ]
-            STATE["stats"]["sent_total"] += sent_ok
-            save_state(STATE)
-
-        remaining = len(STATE["pending_posts"])
-
-    await msg.reply_text(
-        f"✅ Inviati: <b>{sent_ok}</b>\n"
-        f"📦 Rimasti in coda: <b>{remaining}</b>\n"
-        f"🎲 Ordine: <b>casuale</b>",
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-
-
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
@@ -562,24 +599,159 @@ async def catch_id_everywhere(update: Update, context: ContextTypes.DEFAULT_TYPE
         await cmd_id(update, context)
 
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("HANDLER ERROR: %s", context.error)
-
-
 # =========================
-# HANDLE POSTS
+# COMMANDS
 # =========================
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if OWNER_USER_ID_INT is None:
-        return
-
-    if not owner_only(update):
-        return
-
-    msg = update.message
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     if not msg:
         return
 
+    await msg.reply_text(
+        "✅ Bot attivo.\n"
+        "Privato col bot: inoltra i post da convertire.\n"
+        "Il bot li manda in POST PRONTI.\n"
+        "Comandi:\n"
+        "/totale\n"
+        "/invio 50\n"
+        "/invio 80\n"
+        "/id"
+    )
+
+
+async def cmd_totale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
+    if not await require_owner_and_command_chat(update):
+        return
+
+    stats = await queue_stats()
+    await msg.reply_text(
+        f"📦 In coda in POST PRONTI: <b>{stats['pending']}</b>\n"
+        f"🔁 Convertiti totali: <b>{stats['converted_total']}</b>\n"
+        f"🚀 Inviati totali: <b>{stats['sent_total']}</b>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
+    if not await require_owner_and_command_chat(update):
+        return
+
+    if FINAL_CHAT_ID_INT is None:
+        await msg.reply_text(
+            "⚠️ BEST_FIND_CHAT_ID / FINAL_CHAT_ID non impostato nel .env."
+        )
+        return
+
+    pending = await queue_list_pending()
+    if not pending:
+        await msg.reply_text("📭 Nessun post in coda.")
+        return
+
+    limit = len(pending)
+    if context.args:
+        try:
+            limit = int(context.args[0])
+            if limit <= 0:
+                raise ValueError
+        except ValueError:
+            await msg.reply_text("Uso corretto: /invio 50")
+            return
+
+    limit = min(limit, len(pending))
+    selected = random.sample(pending, k=limit)
+
+    sent_ok = 0
+    failed = 0
+
+    for idx, item in enumerate(selected, start=1):
+        ok = await send_to_final_destination(context.bot, item)
+        if ok:
+            await delete_from_post_pronti(context.bot, item.get("holding_message_ids") or [])
+            await queue_mark_sent_and_remove(item["id"])
+            sent_ok += 1
+        else:
+            failed += 1
+
+        if idx < len(selected):
+            await asyncio.sleep(random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX))
+
+    remaining = await queue_count()
+
+    await msg.reply_text(
+        f"✅ Inviati: <b>{sent_ok}</b>\n"
+        f"❌ Falliti: <b>{failed}</b>\n"
+        f"📦 Rimasti in coda: <b>{remaining}</b>\n"
+        f"🎲 Ordine: <b>casuale / sfalsato</b>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+# =========================
+# PRIVATE INPUT -> CONVERT -> POST PRONTI
+# =========================
+async def finalize_media_group(key: str, bot) -> None:
+    while True:
+        await asyncio.sleep(MEDIA_GROUP_WAIT)
+
+        async with BUFFERS_LOCK:
+            buf = BUFFERS.get(key)
+            if not buf:
+                return
+
+            idle = asyncio.get_running_loop().time() - buf.last_ts
+            if idle < MEDIA_GROUP_WAIT:
+                continue
+
+            BUFFERS.pop(key, None)
+
+        unique_photos = list(dict.fromkeys(buf.photo_file_ids))
+        if not unique_photos:
+            return
+
+        photos = random.sample(unique_photos, MAX_PHOTOS) if len(unique_photos) > MAX_PHOTOS else unique_photos
+        caption_html = buf.caption_html or ""
+
+        rewritten_html, changed = rewrite_html_message_safe(caption_html)
+        if not changed:
+            return
+
+        item = {
+            "kind": "album",
+            "photos": photos,
+            "caption_html": truncate_text(rewritten_html, PHOTO_CAPTION_LIMIT),
+        }
+        await queue_and_publish_to_post_pronti(bot, item)
+        return
+
+
+async def handle_private_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.message
+
+    if not chat or not msg:
+        return
+
+    if chat.type != "private":
+        return
+
+    if not await require_owner(update):
+        return
+
+    if POST_PRONTI_CHAT_ID_INT is None:
+        await msg.reply_text("⚠️ POST_PRONTI_CHAT_ID non impostato nel .env.")
+        return
+
+    # album
     if msg.media_group_id and msg.photo:
         key = f"{msg.chat_id}:{msg.media_group_id}"
 
@@ -597,56 +769,75 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buf.last_ts = asyncio.get_running_loop().time()
 
             if buf.task is None or buf.task.done():
-                buf.task = context.application.create_task(finalize_media_group(key))
+                buf.task = context.application.create_task(
+                    finalize_media_group(key, context.bot)
+                )
         return
 
+    # foto singola
     if msg.photo:
         caption_html = msg.caption_html or ""
         rewritten_html, changed = rewrite_html_message_safe(caption_html)
-
         if not changed:
             return
 
-        await add_pending_post({
+        item = {
             "kind": "album",
             "photos": [msg.photo[-1].file_id],
             "caption_html": truncate_text(rewritten_html, PHOTO_CAPTION_LIMIT),
-            "created_at": now_iso(),
-        })
+        }
+        await queue_and_publish_to_post_pronti(context.bot, item)
         return
 
+    # testo
     text_html = msg.text_html or ""
     if text_html:
         rewritten_html, changed = rewrite_html_message_safe(text_html)
-
         if not changed:
             return
 
-        await add_pending_post({
+        item = {
             "kind": "text",
             "html": truncate_text(rewritten_html, TEXT_LIMIT),
-            "created_at": now_iso(),
-        })
+        }
+        await queue_and_publish_to_post_pronti(context.bot, item)
         return
+
+
+# =========================
+# ERROR
+# =========================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("HANDLER ERROR: %s", context.error)
 
 
 # =========================
 # MAIN
 # =========================
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    request = HTTPXRequest(
+        connection_pool_size=20,
+        read_timeout=HTTP_TIMEOUT,
+        write_timeout=HTTP_TIMEOUT,
+        connect_timeout=HTTP_TIMEOUT,
+        pool_timeout=HTTP_TIMEOUT,
+    )
 
-    # intercetta /id in privato, gruppo, supergruppo e canale
+    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+
+    # /id in ogni tipo di chat
     app.add_handler(TypeHandler(Update, catch_id_everywhere), group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("totale", cmd_totale))
+    app.add_handler(CommandHandler(["totale", "quanti"], cmd_totale))
     app.add_handler(CommandHandler("invio", cmd_invio))
 
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle))
+    # input privato del bot
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_private_input))
+
     app.add_error_handler(on_error)
 
-    log.info("Bot running: queue manuale + /totale + /invio + /id + cravattacinese canonical")
+    log.info("Bot running: privato -> POST PRONTI -> /invio N -> canale finale")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
