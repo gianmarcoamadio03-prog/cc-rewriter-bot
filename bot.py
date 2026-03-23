@@ -77,7 +77,7 @@ def get_env_float(name: str, default: float) -> float:
 
 BOT_TOKEN = must_env("BOT_TOKEN")
 
-# opzionali all'avvio, così /id può funzionare anche prima della configurazione completa
+# opzionali all'avvio: così /id funziona anche prima della configurazione completa
 OWNER_USER_ID_INT = get_env_int("OWNER_USER_ID", None)
 OUTPUT_CHAT_ID_INT = get_env_int("OUTPUT_CHAT_ID", None)
 BEST_FIND_CHAT_ID_INT = get_env_int("BEST_FIND_CHAT_ID", OUTPUT_CHAT_ID_INT)
@@ -103,6 +103,9 @@ TEXT_LIMITER = AsyncLimiter(max(int(TEXT_RATE), 1), 1.0)
 MEDIA_LIMITER = AsyncLimiter(max(int(MEDIA_RATE), 1), 1.0)
 
 STATE_LOCK = asyncio.Lock()
+
+# regex per fallback /id nei gruppi
+ID_CMD_RE = re.compile(r"^/id(?:@[A-Za-z0-9_]+)?$", re.IGNORECASE)
 
 # =========================
 # STATE
@@ -187,7 +190,7 @@ def owner_only(update: Update) -> bool:
 async def require_owner(update: Update) -> bool:
     if OWNER_USER_ID_INT is None:
         await update.effective_message.reply_text(
-            "⚠️ OWNER_USER_ID non è ancora impostato.\n"
+            "⚠️ OWNER_USER_ID non impostato.\n"
             "Usa /id in privato col bot, copia il tuo User ID nel file .env come OWNER_USER_ID e riavvia il bot."
         )
         return False
@@ -325,7 +328,6 @@ def rewrite_html_message_safe(html_text: str) -> tuple[str, bool]:
         return f'href="{html.escape(new, quote=True)}"'
 
     out = HREF_RE.sub(href_repl, html_text)
-
     parts = re.split(r"(<[^>]+>)", out)
 
     def repl_visible(match):
@@ -492,7 +494,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Bot attivo.\n"
         "Inoltrami i post in privato.\n"
         "/totale = quanti ha convertito e quanti sono in coda\n"
-        "/invio = invia la coda nel gruppo Best Find in ordine casuale\n"
+        "/invio = invia la coda nel gruppo in ordine casuale\n"
         "/id = mostra User ID e Chat ID della chat corrente",
         disable_web_page_preview=True,
     )
@@ -564,19 +566,60 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
+    msg = update.effective_message
+
+    log.info(
+        "CMD_ID | chat_id=%s | chat_type=%s | user_id=%s | text=%r",
+        getattr(chat, "id", None),
+        getattr(chat, "type", None),
+        getattr(user, "id", None),
+        getattr(msg, "text", None),
+    )
 
     if not chat or not user:
         return
 
-    await update.message.reply_text(
-        "🆔 Dati correnti\n"
-        f"User ID: <code>{user.id}</code>\n"
-        f"Chat ID: <code>{chat.id}</code>\n"
-        f"Nome chat: <b>{html.escape(chat.title or chat.full_name or 'Chat privata')}</b>\n"
-        f"Tipo chat: <b>{html.escape(chat.type)}</b>",
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=(
+            "🆔 Dati correnti\n"
+            f"User ID: <code>{user.id}</code>\n"
+            f"Chat ID: <code>{chat.id}</code>\n"
+            f"Nome chat: <b>{html.escape(chat.title or chat.full_name or 'Chat privata')}</b>\n"
+            f"Tipo chat: <b>{html.escape(str(chat.type))}</b>"
+        ),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+# =========================
+# DEBUG / FALLBACK
+# =========================
+async def debug_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+
+    log.info(
+        "UPDATE | chat_id=%s | chat_type=%s | user_id=%s | text=%r",
+        getattr(chat, "id", None),
+        getattr(chat, "type", None),
+        getattr(user, "id", None),
+        getattr(msg, "text", None),
+    )
+
+
+async def id_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = (msg.text or "").strip() if msg and msg.text else ""
+
+    if ID_CMD_RE.match(text):
+        await cmd_id(update, context)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("HANDLER ERROR: %s", context.error)
 
 
 # =========================
@@ -591,6 +634,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message
     if not msg:
+        return
+
+    # ignora i comandi, già gestiti altrove
+    if msg.text and ID_CMD_RE.match(msg.text.strip()):
         return
 
     if msg.media_group_id and msg.photo:
@@ -662,13 +709,24 @@ def main():
         .build()
     )
 
+    # debug prima di tutto
+    app.add_handler(MessageHandler(filters.ALL, debug_updates), group=-1)
+
+    # fallback /id anche nei gruppi/supergruppi
+    app.add_handler(MessageHandler(filters.Regex(ID_CMD_RE), id_fallback), group=0)
+
+    # comandi
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("totale", cmd_totale))
     app.add_handler(CommandHandler("invio", cmd_invio))
     app.add_handler(CommandHandler("id", cmd_id))
+
+    # messaggi normali
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle))
 
-    log.info("Bot running: queue manuale + /totale + /invio + /id + cravattacinese canonical")
+    app.add_error_handler(on_error)
+
+    log.info("Bot running: queue manuale + /totale + /invio + /id + debug + cravattacinese canonical")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
