@@ -77,7 +77,7 @@ def get_env_float(name: str, default: float) -> float:
 
 BOT_TOKEN = must_env("BOT_TOKEN")
 
-# opzionali all'avvio: così /id funziona anche prima della configurazione completa
+# opzionali all'avvio
 OWNER_USER_ID_INT = get_env_int("OWNER_USER_ID", None)
 OUTPUT_CHAT_ID_INT = get_env_int("OUTPUT_CHAT_ID", None)
 BEST_FIND_CHAT_ID_INT = get_env_int("BEST_FIND_CHAT_ID", OUTPUT_CHAT_ID_INT)
@@ -104,7 +104,6 @@ MEDIA_LIMITER = AsyncLimiter(max(int(MEDIA_RATE), 1), 1.0)
 
 STATE_LOCK = asyncio.Lock()
 
-# regex per fallback /id nei gruppi
 ID_CMD_RE = re.compile(r"^/id(?:@[A-Za-z0-9_]+)?$", re.IGNORECASE)
 
 # =========================
@@ -476,7 +475,7 @@ async def send_pending_item(bot, item: dict) -> bool:
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if OWNER_USER_ID_INT is None:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "✅ Bot avviato.\n"
             "Prima configurazione:\n"
             "1) usa /id in privato col bot per leggere il tuo User ID\n"
@@ -490,7 +489,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         return
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "✅ Bot attivo.\n"
         "Inoltrami i post in privato.\n"
         "/totale = quanti ha convertito e quanti sono in coda\n"
@@ -505,7 +504,7 @@ async def cmd_totale(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     stats = await get_stats()
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"📦 In coda: <b>{stats['pending']}</b>\n"
         f"🔁 Convertiti totali: <b>{stats['converted_total']}</b>\n"
         f"🚀 Inviati totali: <b>{stats['sent_total']}</b>",
@@ -519,7 +518,7 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if BEST_FIND_CHAT_ID_INT is None:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "⚠️ BEST_FIND_CHAT_ID / OUTPUT_CHAT_ID non impostato.\n"
             "Usa /id nel gruppo di destinazione, copia il Chat ID nel file .env e riavvia il bot."
         )
@@ -529,7 +528,7 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = list(STATE["pending_posts"])
 
     if not pending:
-        await update.message.reply_text("📭 Nessun post in coda da inviare.")
+        await update.effective_message.reply_text("📭 Nessun post in coda da inviare.")
         return
 
     random.shuffle(pending)
@@ -554,7 +553,7 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         remaining = len(STATE["pending_posts"])
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"✅ Inviati: <b>{sent_ok}</b>\n"
         f"📦 Rimasti in coda: <b>{remaining}</b>\n"
         f"🎲 Ordine: <b>casuale</b>",
@@ -566,15 +565,6 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
-    msg = update.effective_message
-
-    log.info(
-        "CMD_ID | chat_id=%s | chat_type=%s | user_id=%s | text=%r",
-        getattr(chat, "id", None),
-        getattr(chat, "type", None),
-        getattr(user, "id", None),
-        getattr(msg, "text", None),
-    )
 
     if not chat or not user:
         return
@@ -593,31 +583,6 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# =========================
-# DEBUG / FALLBACK
-# =========================
-async def debug_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-
-    log.info(
-        "UPDATE | chat_id=%s | chat_type=%s | user_id=%s | text=%r",
-        getattr(chat, "id", None),
-        getattr(chat, "type", None),
-        getattr(user, "id", None),
-        getattr(msg, "text", None),
-    )
-
-
-async def id_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    text = (msg.text or "").strip() if msg and msg.text else ""
-
-    if ID_CMD_RE.match(text):
-        await cmd_id(update, context)
-
-
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("HANDLER ERROR: %s", context.error)
 
@@ -634,10 +599,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message
     if not msg:
-        return
-
-    # ignora i comandi, già gestiti altrove
-    if msg.text and ID_CMD_RE.match(msg.text.strip()):
         return
 
     if msg.media_group_id and msg.photo:
@@ -709,24 +670,17 @@ def main():
         .build()
     )
 
-    # debug prima di tutto
-    app.add_handler(MessageHandler(filters.ALL, debug_updates), group=-1)
-
-    # fallback /id anche nei gruppi/supergruppi
-    app.add_handler(MessageHandler(filters.Regex(ID_CMD_RE), id_fallback), group=0)
-
-    # comandi
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("totale", cmd_totale))
     app.add_handler(CommandHandler("invio", cmd_invio))
-    app.add_handler(CommandHandler("id", cmd_id))
 
-    # messaggi normali
+    # /id in privato, gruppo e supergruppo
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(ID_CMD_RE), cmd_id))
+
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle))
-
     app.add_error_handler(on_error)
 
-    log.info("Bot running: queue manuale + /totale + /invio + /id + debug + cravattacinese canonical")
+    log.info("Bot running: queue manuale + /totale + /invio + /id + cravattacinese canonical")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
