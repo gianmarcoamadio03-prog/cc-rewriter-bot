@@ -47,28 +47,57 @@ def must_env(name: str) -> str:
     return str(v).strip()
 
 
+def get_env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = str(v).strip()
+    return v if v else default
+
+
+def get_env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        raise RuntimeError(f"Env var {name} must be an integer")
+
+
+def get_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        raise RuntimeError(f"Env var {name} must be a float")
+
+
 BOT_TOKEN = must_env("BOT_TOKEN")
-OWNER_USER_ID_INT = int(must_env("OWNER_USER_ID"))
 
-# gruppo finale dove /invio pubblica
-BEST_FIND_CHAT_ID_INT = int(os.getenv("BEST_FIND_CHAT_ID", must_env("OUTPUT_CHAT_ID")))
+# opzionali all'avvio, così /id può funzionare anche prima della configurazione completa
+OWNER_USER_ID_INT = get_env_int("OWNER_USER_ID", None)
+OUTPUT_CHAT_ID_INT = get_env_int("OUTPUT_CHAT_ID", None)
+BEST_FIND_CHAT_ID_INT = get_env_int("BEST_FIND_CHAT_ID", OUTPUT_CHAT_ID_INT)
 
-MULEBUY_REF = os.getenv("MULEBUY_REF", "").strip()
-CNFANS_REF = os.getenv("CNFANS_REF", "222394").strip()
+MULEBUY_REF = get_env_str("MULEBUY_REF", "") or ""
+CNFANS_REF = get_env_str("CNFANS_REF", "222394") or "222394"
 
-TZ = os.getenv("TZ", "Europe/Rome")
+TZ = get_env_str("TZ", "Europe/Rome") or "Europe/Rome"
 ZONE = ZoneInfo(TZ)
 
-MAX_PHOTOS = int(os.getenv("MAX_PHOTOS", "4"))
-MEDIA_GROUP_WAIT = float(os.getenv("MEDIA_GROUP_WAIT", "0.8"))
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "60"))
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
+MAX_PHOTOS = get_env_int("MAX_PHOTOS", 4) or 4
+MEDIA_GROUP_WAIT = get_env_float("MEDIA_GROUP_WAIT", 0.8)
+HTTP_TIMEOUT = get_env_float("HTTP_TIMEOUT", 60.0)
+STATE_FILE = get_env_str("STATE_FILE", "state.json") or "state.json"
 
-TEXT_RATE = float(os.getenv("TEXT_RATE", "12"))
-MEDIA_RATE = float(os.getenv("MEDIA_RATE", "5"))
+TEXT_RATE = get_env_float("TEXT_RATE", 12.0)
+MEDIA_RATE = get_env_float("MEDIA_RATE", 5.0)
 
-TEXT_LIMIT = int(os.getenv("TEXT_LIMIT", "3900"))
-PHOTO_CAPTION_LIMIT = int(os.getenv("PHOTO_CAPTION_LIMIT", "950"))
+TEXT_LIMIT = get_env_int("TEXT_LIMIT", 3900) or 3900
+PHOTO_CAPTION_LIMIT = get_env_int("PHOTO_CAPTION_LIMIT", 950) or 950
 
 TEXT_LIMITER = AsyncLimiter(max(int(TEXT_RATE), 1), 1.0)
 MEDIA_LIMITER = AsyncLimiter(max(int(MEDIA_RATE), 1), 1.0)
@@ -148,7 +177,25 @@ async def get_stats() -> dict:
 # =========================
 def owner_only(update: Update) -> bool:
     user = update.effective_user
-    return bool(user and user.id == OWNER_USER_ID_INT)
+    return bool(
+        OWNER_USER_ID_INT is not None and
+        user is not None and
+        user.id == OWNER_USER_ID_INT
+    )
+
+
+async def require_owner(update: Update) -> bool:
+    if OWNER_USER_ID_INT is None:
+        await update.effective_message.reply_text(
+            "⚠️ OWNER_USER_ID non è ancora impostato.\n"
+            "Usa /id in privato col bot, copia il tuo User ID nel file .env come OWNER_USER_ID e riavvia il bot."
+        )
+        return False
+
+    if not owner_only(update):
+        return False
+
+    return True
 
 
 def truncate_text(s: str, limit: int) -> str:
@@ -341,7 +388,6 @@ async def finalize_media_group(key: str):
         caption_html = buf.caption_html or ""
         rewritten_html, changed = rewrite_html_message_safe(caption_html)
 
-        # salva solo se c'è stata almeno una modifica reale ai link
         if not changed:
             return
 
@@ -427,6 +473,18 @@ async def send_pending_item(bot, item: dict) -> bool:
 # COMMANDS
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_USER_ID_INT is None:
+        await update.message.reply_text(
+            "✅ Bot avviato.\n"
+            "Prima configurazione:\n"
+            "1) usa /id in privato col bot per leggere il tuo User ID\n"
+            "2) mettilo nel file .env come OWNER_USER_ID\n"
+            "3) usa /id nel gruppo per leggere il Chat ID del gruppo\n"
+            "4) mettilo nel file .env come BEST_FIND_CHAT_ID oppure OUTPUT_CHAT_ID\n"
+            "5) riavvia il bot"
+        )
+        return
+
     if not owner_only(update):
         return
 
@@ -435,13 +493,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Inoltrami i post in privato.\n"
         "/totale = quanti ha convertito e quanti sono in coda\n"
         "/invio = invia la coda nel gruppo Best Find in ordine casuale\n"
-        "/id = mostra il chat id della chat o del gruppo corrente",
+        "/id = mostra User ID e Chat ID della chat corrente",
         disable_web_page_preview=True,
     )
 
 
 async def cmd_totale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner_only(update):
+    if not await require_owner(update):
         return
 
     stats = await get_stats()
@@ -455,7 +513,14 @@ async def cmd_totale(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner_only(update):
+    if not await require_owner(update):
+        return
+
+    if BEST_FIND_CHAT_ID_INT is None:
+        await update.message.reply_text(
+            "⚠️ BEST_FIND_CHAT_ID / OUTPUT_CHAT_ID non impostato.\n"
+            "Usa /id nel gruppo di destinazione, copia il Chat ID nel file .env e riavvia il bot."
+        )
         return
 
     async with STATE_LOCK:
@@ -497,18 +562,18 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner_only(update):
-        return
-
     chat = update.effective_chat
-    if not chat:
+    user = update.effective_user
+
+    if not chat or not user:
         return
 
     await update.message.reply_text(
-        "🆔 Informazioni chat corrente\n"
-        f"Nome: <b>{html.escape(chat.title or chat.full_name or 'Chat privata')}</b>\n"
-        f"Tipo: <b>{html.escape(chat.type)}</b>\n"
-        f"Chat ID: <code>{chat.id}</code>",
+        "🆔 Dati correnti\n"
+        f"User ID: <code>{user.id}</code>\n"
+        f"Chat ID: <code>{chat.id}</code>\n"
+        f"Nome chat: <b>{html.escape(chat.title or chat.full_name or 'Chat privata')}</b>\n"
+        f"Tipo chat: <b>{html.escape(chat.type)}</b>",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -518,6 +583,9 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MESSAGE HANDLER
 # =========================
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_USER_ID_INT is None:
+        return
+
     if not owner_only(update):
         return
 
@@ -525,7 +593,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # Album foto
     if msg.media_group_id and msg.photo:
         key = f"{msg.chat_id}:{msg.media_group_id}"
 
@@ -546,7 +613,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 buf.task = context.application.create_task(finalize_media_group(key))
         return
 
-    # Singola foto
     if msg.photo:
         caption_html = msg.caption_html or ""
         rewritten_html, changed = rewrite_html_message_safe(caption_html)
@@ -562,7 +628,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         return
 
-    # Testo
     text_html = msg.text_html or ""
     if text_html:
         rewritten_html, changed = rewrite_html_message_safe(text_html)
