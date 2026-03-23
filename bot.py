@@ -12,17 +12,15 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from aiolimiter import AsyncLimiter
-
 from telegram import Update, InputMediaPhoto
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, Forbidden
-from telegram.request import HTTPXRequest
+from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest, Forbidden
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -35,81 +33,48 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-log = logging.getLogger("cc-converter")
+log = logging.getLogger("cc-rewriter-bot")
 
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+OWNER_USER_ID = (os.getenv("OWNER_USER_ID") or "").strip()
+OUTPUT_CHAT_ID = (os.getenv("OUTPUT_CHAT_ID") or "").strip()
+BEST_FIND_CHAT_ID = (os.getenv("BEST_FIND_CHAT_ID") or "").strip()
 
-def must_env(name: str) -> str:
-    v = os.getenv(name)
-    if v is None or not str(v).strip():
-        raise RuntimeError(f"Missing env var: {name}")
-    return str(v).strip()
+MULEBUY_REF = (os.getenv("MULEBUY_REF") or "200836051").strip()
+CNFANS_REF = (os.getenv("CNFANS_REF") or "222394").strip()
 
+TZ = (os.getenv("TZ") or "Europe/Rome").strip()
+MAX_PHOTOS = int((os.getenv("MAX_PHOTOS") or "4").strip())
+MEDIA_GROUP_WAIT = float((os.getenv("MEDIA_GROUP_WAIT") or "1.2").strip())
+STATE_FILE = (os.getenv("STATE_FILE") or "state.json").strip()
 
-def get_env_str(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    v = str(v).strip()
-    return v if v else default
+TEXT_LIMIT = int((os.getenv("TEXT_LIMIT") or "3900").strip())
+PHOTO_CAPTION_LIMIT = int((os.getenv("PHOTO_CAPTION_LIMIT") or "950").strip())
 
+if not BOT_TOKEN:
+    raise RuntimeError("Manca BOT_TOKEN nel .env")
 
-def get_env_int(name: str, default: Optional[int] = None) -> Optional[int]:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        return int(str(raw).strip())
-    except ValueError:
-        raise RuntimeError(f"Env var {name} must be an integer")
+OWNER_USER_ID_INT = int(OWNER_USER_ID) if OWNER_USER_ID else None
+BEST_FIND_CHAT_ID_INT = (
+    int(BEST_FIND_CHAT_ID) if BEST_FIND_CHAT_ID
+    else (int(OUTPUT_CHAT_ID) if OUTPUT_CHAT_ID else None)
+)
 
-
-def get_env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        return float(str(raw).strip())
-    except ValueError:
-        raise RuntimeError(f"Env var {name} must be a float")
-
-
-BOT_TOKEN = must_env("BOT_TOKEN")
-
-# opzionali all'avvio
-OWNER_USER_ID_INT = get_env_int("OWNER_USER_ID", None)
-OUTPUT_CHAT_ID_INT = get_env_int("OUTPUT_CHAT_ID", None)
-BEST_FIND_CHAT_ID_INT = get_env_int("BEST_FIND_CHAT_ID", OUTPUT_CHAT_ID_INT)
-
-MULEBUY_REF = get_env_str("MULEBUY_REF", "") or ""
-CNFANS_REF = get_env_str("CNFANS_REF", "222394") or "222394"
-
-TZ = get_env_str("TZ", "Europe/Rome") or "Europe/Rome"
 ZONE = ZoneInfo(TZ)
 
-MAX_PHOTOS = get_env_int("MAX_PHOTOS", 4) or 4
-MEDIA_GROUP_WAIT = get_env_float("MEDIA_GROUP_WAIT", 0.8)
-HTTP_TIMEOUT = get_env_float("HTTP_TIMEOUT", 60.0)
-STATE_FILE = get_env_str("STATE_FILE", "state.json") or "state.json"
-
-TEXT_RATE = get_env_float("TEXT_RATE", 12.0)
-MEDIA_RATE = get_env_float("MEDIA_RATE", 5.0)
-
-TEXT_LIMIT = get_env_int("TEXT_LIMIT", 3900) or 3900
-PHOTO_CAPTION_LIMIT = get_env_int("PHOTO_CAPTION_LIMIT", 950) or 950
-
-TEXT_LIMITER = AsyncLimiter(max(int(TEXT_RATE), 1), 1.0)
-MEDIA_LIMITER = AsyncLimiter(max(int(MEDIA_RATE), 1), 1.0)
-
 STATE_LOCK = asyncio.Lock()
+BUFFERS_LOCK = asyncio.Lock()
 
+URL_RE = re.compile(r"(https?://[^\s<>\]]+)", re.IGNORECASE)
+HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
+TRAILING_PUNCT = ".,;:!?)\u201d\u2019]"
 ID_CMD_RE = re.compile(r"^/id(?:@[A-Za-z0-9_]+)?$", re.IGNORECASE)
+
 
 # =========================
 # STATE
 # =========================
-def _base_state() -> dict:
+def base_state() -> dict:
     return {
         "next_post_id": 1,
         "pending_posts": [],
@@ -122,23 +87,23 @@ def _base_state() -> dict:
 
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return _base_state()
+        return base_state()
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return _base_state()
+        return base_state()
 
-    base = _base_state()
-    base.update(data or {})
-    base["stats"] = {**_base_state()["stats"], **(base.get("stats") or {})}
-    base["pending_posts"] = base.get("pending_posts") or []
+    out = base_state()
+    out.update(data or {})
+    out["stats"] = {**base_state()["stats"], **(out.get("stats") or {})}
+    out["pending_posts"] = out.get("pending_posts") or []
 
-    if not isinstance(base.get("next_post_id"), int):
-        base["next_post_id"] = 1
+    if not isinstance(out.get("next_post_id"), int):
+        out["next_post_id"] = 1
 
-    return base
+    return out
 
 
 def save_state(state: dict) -> None:
@@ -158,7 +123,6 @@ async def add_pending_post(item: dict) -> int:
         row = dict(item)
         row["id"] = STATE["next_post_id"]
         STATE["next_post_id"] += 1
-
         STATE["pending_posts"].append(row)
         STATE["stats"]["converted_total"] += 1
         save_state(STATE)
@@ -187,8 +151,12 @@ def owner_only(update: Update) -> bool:
 
 
 async def require_owner(update: Update) -> bool:
+    msg = update.effective_message
+    if not msg:
+        return False
+
     if OWNER_USER_ID_INT is None:
-        await update.effective_message.reply_text(
+        await msg.reply_text(
             "⚠️ OWNER_USER_ID non impostato.\n"
             "Usa /id in privato col bot, copia il tuo User ID nel file .env come OWNER_USER_ID e riavvia il bot."
         )
@@ -200,28 +168,23 @@ async def require_owner(update: Update) -> bool:
     return True
 
 
-def truncate_text(s: str, limit: int) -> str:
-    if not s:
+def truncate_text(text: str, limit: int) -> str:
+    if not text:
         return ""
-    if len(s) <= limit:
-        return s
-    return s[: limit - 1] + "…"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 async def with_retry(coro_factory, retries: int = 5):
     last_exc = None
-
     for attempt in range(1, retries + 1):
         try:
             return await coro_factory()
         except RetryAfter as e:
             wait_s = int(getattr(e, "retry_after", 1)) + 1
-            log.warning("RetryAfter -> sleep %ss", wait_s)
             await asyncio.sleep(wait_s)
             last_exc = e
         except (TimedOut, NetworkError) as e:
             wait_s = min(2 ** attempt, 8)
-            log.warning("Network error -> retry in %ss", wait_s)
             await asyncio.sleep(wait_s)
             last_exc = e
         except Exception as e:
@@ -235,11 +198,6 @@ async def with_retry(coro_factory, retries: int = 5):
 # =========================
 # URL REWRITE
 # =========================
-URL_RE = re.compile(r"(https?://[^\s<>\]]+)", re.IGNORECASE)
-HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
-TRAILING_PUNCT = ".,;:!?)\u201d\u2019]"
-
-
 def strip_trailing_punct(url: str):
     trail = ""
     while url and url[-1] in TRAILING_PUNCT:
@@ -270,8 +228,7 @@ def rebuild_url(parsed, netloc: Optional[str] = None, query: Optional[str] = Non
 
 def transform_cravattacinese(url: str) -> str:
     parsed = urlparse(url)
-    host = normalize_netloc(parsed.netloc)
-    if host != "cravattacinese.com":
+    if normalize_netloc(parsed.netloc) != "cravattacinese.com":
         return url
     return rebuild_url(parsed, netloc="www.cravattacinese.com")
 
@@ -358,7 +315,6 @@ class MediaGroupBuffer:
 
 
 BUFFERS: Dict[str, MediaGroupBuffer] = {}
-BUFFERS_LOCK = asyncio.Lock()
 
 
 async def finalize_media_group(key: str):
@@ -380,11 +336,7 @@ async def finalize_media_group(key: str):
         if not unique_photos:
             return
 
-        photos = (
-            random.sample(unique_photos, MAX_PHOTOS)
-            if len(unique_photos) > MAX_PHOTOS
-            else unique_photos
-        )
+        photos = random.sample(unique_photos, MAX_PHOTOS) if len(unique_photos) > MAX_PHOTOS else unique_photos
 
         caption_html = buf.caption_html or ""
         rewritten_html, changed = rewrite_html_message_safe(caption_html)
@@ -402,7 +354,7 @@ async def finalize_media_group(key: str):
 
 
 # =========================
-# SEND LOGIC
+# SEND
 # =========================
 async def send_pending_item(bot, item: dict) -> bool:
     kind = item.get("kind")
@@ -413,13 +365,12 @@ async def send_pending_item(bot, item: dict) -> bool:
             if not text:
                 return False
 
-            async with TEXT_LIMITER:
-                await with_retry(lambda: bot.send_message(
-                    chat_id=BEST_FIND_CHAT_ID_INT,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                ))
+            await with_retry(lambda: bot.send_message(
+                chat_id=BEST_FIND_CHAT_ID_INT,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            ))
             return True
 
         if kind == "album":
@@ -430,13 +381,12 @@ async def send_pending_item(bot, item: dict) -> bool:
             caption_html = truncate_text(item.get("caption_html", ""), PHOTO_CAPTION_LIMIT)
 
             if len(photos) == 1:
-                async with MEDIA_LIMITER:
-                    await with_retry(lambda: bot.send_photo(
-                        chat_id=BEST_FIND_CHAT_ID_INT,
-                        photo=photos[0],
-                        caption=caption_html or None,
-                        parse_mode=ParseMode.HTML if caption_html else None,
-                    ))
+                await with_retry(lambda: bot.send_photo(
+                    chat_id=BEST_FIND_CHAT_ID_INT,
+                    photo=photos[0],
+                    caption=caption_html or None,
+                    parse_mode=ParseMode.HTML if caption_html else None,
+                ))
                 return True
 
             media = []
@@ -450,11 +400,10 @@ async def send_pending_item(bot, item: dict) -> bool:
                 else:
                     media.append(InputMediaPhoto(media=file_id))
 
-            async with MEDIA_LIMITER:
-                await with_retry(lambda: bot.send_media_group(
-                    chat_id=BEST_FIND_CHAT_ID_INT,
-                    media=media,
-                ))
+            await with_retry(lambda: bot.send_media_group(
+                chat_id=BEST_FIND_CHAT_ID_INT,
+                media=media,
+            ))
             return True
 
         return False
@@ -474,13 +423,17 @@ async def send_pending_item(bot, item: dict) -> bool:
 # COMMANDS
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
     if OWNER_USER_ID_INT is None:
-        await update.effective_message.reply_text(
+        await msg.reply_text(
             "✅ Bot avviato.\n"
             "Prima configurazione:\n"
             "1) usa /id in privato col bot per leggere il tuo User ID\n"
             "2) mettilo nel file .env come OWNER_USER_ID\n"
-            "3) usa /id nel gruppo per leggere il Chat ID del gruppo\n"
+            "3) usa /id nel gruppo o canale per leggere il Chat ID\n"
             "4) mettilo nel file .env come BEST_FIND_CHAT_ID oppure OUTPUT_CHAT_ID\n"
             "5) riavvia il bot"
         )
@@ -489,22 +442,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         return
 
-    await update.effective_message.reply_text(
+    await msg.reply_text(
         "✅ Bot attivo.\n"
         "Inoltrami i post in privato.\n"
         "/totale = quanti ha convertito e quanti sono in coda\n"
-        "/invio = invia la coda nel gruppo in ordine casuale\n"
+        "/invio = invia la coda nel gruppo/canale in ordine casuale\n"
         "/id = mostra User ID e Chat ID della chat corrente",
         disable_web_page_preview=True,
     )
 
 
 async def cmd_totale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
     if not await require_owner(update):
         return
 
     stats = await get_stats()
-    await update.effective_message.reply_text(
+    await msg.reply_text(
         f"📦 In coda: <b>{stats['pending']}</b>\n"
         f"🔁 Convertiti totali: <b>{stats['converted_total']}</b>\n"
         f"🚀 Inviati totali: <b>{stats['sent_total']}</b>",
@@ -514,13 +471,17 @@ async def cmd_totale(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
     if not await require_owner(update):
         return
 
     if BEST_FIND_CHAT_ID_INT is None:
-        await update.effective_message.reply_text(
+        await msg.reply_text(
             "⚠️ BEST_FIND_CHAT_ID / OUTPUT_CHAT_ID non impostato.\n"
-            "Usa /id nel gruppo di destinazione, copia il Chat ID nel file .env e riavvia il bot."
+            "Usa /id nel gruppo o canale di destinazione, copia il Chat ID nel file .env e riavvia il bot."
         )
         return
 
@@ -528,7 +489,7 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = list(STATE["pending_posts"])
 
     if not pending:
-        await update.effective_message.reply_text("📭 Nessun post in coda da inviare.")
+        await msg.reply_text("📭 Nessun post in coda da inviare.")
         return
 
     random.shuffle(pending)
@@ -553,7 +514,7 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         remaining = len(STATE["pending_posts"])
 
-    await update.effective_message.reply_text(
+    await msg.reply_text(
         f"✅ Inviati: <b>{sent_ok}</b>\n"
         f"📦 Rimasti in coda: <b>{remaining}</b>\n"
         f"🎲 Ordine: <b>casuale</b>",
@@ -564,23 +525,41 @@ async def cmd_invio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
+    msg = update.effective_message
     user = update.effective_user
 
-    if not chat or not user:
+    if not chat or not msg:
         return
+
+    sender_chat = getattr(msg, "sender_chat", None)
+
+    lines = ["🆔 Dati correnti"]
+
+    if user:
+        lines.append(f"User ID: <code>{user.id}</code>")
+    elif sender_chat:
+        lines.append(f"Sender Chat ID: <code>{sender_chat.id}</code>")
+
+    lines.append(f"Chat ID: <code>{chat.id}</code>")
+    lines.append(f"Nome chat: <b>{html.escape(chat.title or chat.full_name or 'Chat privata')}</b>")
+    lines.append(f"Tipo chat: <b>{html.escape(str(chat.type))}</b>")
 
     await context.bot.send_message(
         chat_id=chat.id,
-        text=(
-            "🆔 Dati correnti\n"
-            f"User ID: <code>{user.id}</code>\n"
-            f"Chat ID: <code>{chat.id}</code>\n"
-            f"Nome chat: <b>{html.escape(chat.title or chat.full_name or 'Chat privata')}</b>\n"
-            f"Tipo chat: <b>{html.escape(str(chat.type))}</b>"
-        ),
+        text="\n".join(lines),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+async def catch_id_everywhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not getattr(msg, "text", None):
+        return
+
+    text = msg.text.strip()
+    if ID_CMD_RE.match(text):
+        await cmd_id(update, context)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -588,7 +567,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# MESSAGE HANDLER
+# HANDLE POSTS
 # =========================
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if OWNER_USER_ID_INT is None:
@@ -655,27 +634,14 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =========================
 def main():
-    request = HTTPXRequest(
-        connection_pool_size=20,
-        read_timeout=HTTP_TIMEOUT,
-        write_timeout=HTTP_TIMEOUT,
-        connect_timeout=HTTP_TIMEOUT,
-        pool_timeout=HTTP_TIMEOUT,
-    )
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .build()
-    )
+    # intercetta /id in privato, gruppo, supergruppo e canale
+    app.add_handler(TypeHandler(Update, catch_id_everywhere), group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("totale", cmd_totale))
     app.add_handler(CommandHandler("invio", cmd_invio))
-
-    # /id in privato, gruppo e supergruppo
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(ID_CMD_RE), cmd_id))
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle))
     app.add_error_handler(on_error)
@@ -684,7 +650,6 @@ def main():
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        close_loop=False,
     )
 
 
